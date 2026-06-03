@@ -44,7 +44,8 @@ LOCAL_APPS = [
     'accounts',       # RBAC (Roles, Permissions)
     'profiles',     # Student, Teacher, Parent profiles
     'academics',    # Classes, Sections, Enrollments
-    'operations',   # Attendance, Exams, Grades
+    'operations',
+    'school_admin',   # Dashboard, Notifications, Activity Logs
     # 'finance',      # Invoices, Payments
 ]
 

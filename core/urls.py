@@ -12,7 +12,10 @@ urlpatterns = [
     path('api/v1/operations/', include('operations.urls')),
     path('api/v1/accounts/', include('accounts.urls')),
     
-    # Swagger / OpenAPI Endpoints
+    # YOUR ISOLATED ADMIN ROUTE LAYER
+    path('api/v1/school-admin/', include('school_admin.urls')), 
+    
+    # Swagger / OpenAPI Endpoints (Restored!)
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/schema/swagger-ui/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
     path('api/schema/redoc/', SpectacularRedocView.as_view(url_name='schema'), name='redoc'),
