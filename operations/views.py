@@ -5,10 +5,10 @@ from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema
 
 from tenants.views import TenantAwareModelViewSet
-from .models import Attendance, Exam, StudentGrade
+from .models import Attendance, Exam, StudentGrade, Assignment, StudentSubmission
 from .serializers import (
     AttendanceSerializer, BulkAttendanceSerializer,
-    ExamSerializer, StudentGradeSerializer, BulkGradeSubmitSerializer
+    ExamSerializer, StudentGradeSerializer, BulkGradeSubmitSerializer, AssignmentSerializer, StudentSubmissionSerializer
 )
 
 class AttendanceViewSet(TenantAwareModelViewSet):
@@ -113,3 +113,19 @@ class StudentGradeViewSet(TenantAwareModelViewSet):
             {"detail": f"Successfully processed grades for {len(grade_objects)} students."},
             status=status.HTTP_200_OK
         )
+    
+class AssignmentViewSet(TenantAwareModelViewSet):
+    queryset = Assignment.objects.select_related('subject', 'section', 'teacher').all()
+    serializer_class = AssignmentSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # Filter for student's section if student is authenticated
+        if hasattr(self.request.user, 'student_profile'):
+            student_section = self.request.user.student_profile.enrollments.first().section
+            return qs.filter(section=student_section)
+        return qs
+
+class StudentSubmissionViewSet(TenantAwareModelViewSet):
+    queryset = StudentSubmission.objects.all()
+    serializer_class = StudentSubmissionSerializer
