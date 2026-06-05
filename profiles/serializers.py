@@ -6,6 +6,9 @@ class StudentProfileSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(source='user.email', read_only=True)
     first_name = serializers.CharField(source='user.first_name', read_only=True)
     last_name = serializers.CharField(source='user.last_name', read_only=True)
+    address = serializers.CharField(read_only=True)
+    phone_number = serializers.CharField(read_only=True)
+    blood_group = serializers.CharField(read_only=True)
 
     class Meta:
         model = StudentProfile

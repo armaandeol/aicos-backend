@@ -90,3 +90,32 @@ class StudentGrade(TenantAwareModel):
 
     def __str__(self):
         return f"{self.student.user.first_name} | {self.exam.name} | {self.subject.name}: {self.marks_obtained}/{self.max_marks}"
+    
+class Assignment(TenantAwareModel):
+    """Represents a task assigned by a teacher to a section."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    subject = models.ForeignKey('academics.Subject', on_delete=models.CASCADE)
+    section = models.ForeignKey('academics.Section', on_delete=models.CASCADE)
+    teacher = models.ForeignKey('profiles.TeacherProfile', on_delete=models.CASCADE)
+    due_date = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-due_date']
+
+class StudentSubmission(TenantAwareModel):
+    """Tracks a student's submission for a specific assignment."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    assignment = models.ForeignKey(Assignment, on_delete=models.CASCADE, related_name='submissions')
+    student = models.ForeignKey('profiles.StudentProfile', on_delete=models.CASCADE, related_name='submissions')
+    file = models.FileField(upload_to='submissions/', blank=True, null=True)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    grade = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    status = models.CharField(max_length=20, default='Submitted') # Pending, Submitted, Graded
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['school', 'assignment', 'student'], name='unique_student_submission')
+        ]

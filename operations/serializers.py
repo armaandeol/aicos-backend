@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Attendance, Exam, StudentGrade
+from .models import Attendance, Exam, StudentGrade, Assignment, StudentSubmission
 from profiles.models import StudentProfile, TeacherProfile
 from academics.models import TeacherAssignment
 
@@ -111,3 +111,17 @@ class BulkGradeSubmitSerializer(serializers.Serializer):
             raise serializers.ValidationError("One or more students do not exist or belong to another school.")
             
         return attrs
+    
+
+
+class AssignmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Assignment
+        fields = '__all__'
+        read_only_fields = ('school', 'id', 'created_at')
+
+class StudentSubmissionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StudentSubmission
+        fields = '__all__'
+        read_only_fields = ('school', 'id', 'submitted_at')
