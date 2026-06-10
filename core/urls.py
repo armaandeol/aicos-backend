@@ -13,7 +13,10 @@ urlpatterns = [
     path('api/v1/accounts/', include('accounts.urls')),
     
     # YOUR ISOLATED ADMIN ROUTE LAYER
-    path('api/v1/school-admin/', include('school_admin.urls')), 
+    path('api/v1/school-admin/', include('school_admin.urls')),
+    
+    # AI TUTOR MODULE
+    path('api/v1/tutor/', include('tutor.urls')),
     
     # Swagger / OpenAPI Endpoints (Restored!)
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

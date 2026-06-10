@@ -1,9 +1,32 @@
-django 
-djangorestframework 
-psycopg2-binary 
-django-environ 
-drf-spectacular
-djangorestframework-simplejwt 
-django-cors-headers
-Pillow
-gunicorn
+# Core Django & Framework
+django>=6.0,<7.0
+djangorestframework>=3.15.0,<4.0
+
+# Database
+psycopg2-binary>=2.9.0
+
+# Configuration & Environment
+django-environ>=0.11.0
+
+# API Documentation
+drf-spectacular>=0.27.0
+
+# Authentication
+djangorestframework-simplejwt>=5.3.0
+
+# CORS & Security
+django-cors-headers>=4.3.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# Production Server
+gunicorn>=21.0.0
+
+# AI / LLM Integration
+openai>=1.0.0          # For DeepSeek API (OpenAI-compatible)
+requests>=2.31.0       # HTTP client for API calls
+
+# Optional but recommended for better performance
+django-debug-toolbar>=4.0.0    # Debugging (development only)
+python-dotenv>=1.0.0           # Environment variables (backup)

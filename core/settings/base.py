@@ -45,7 +45,8 @@ LOCAL_APPS = [
     'profiles',     # Student, Teacher, Parent profiles
     'academics',    # Classes, Sections, Enrollments
     'operations',
-    'school_admin',   # Dashboard, Notifications, Activity Logs
+    'school_admin',
+      'tutor'  # Dashboard, Notifications, Activity Logs
     # 'finance',      # Invoices, Payments
 ]
 
