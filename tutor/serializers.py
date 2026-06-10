@@ -9,10 +9,11 @@ class MessageSerializer(serializers.ModelSerializer):
 
 class ConversationListSerializer(serializers.ModelSerializer):
     last_message_preview = serializers.SerializerMethodField()
+    is_soft_deleted = serializers.BooleanField(source='is_deleted', read_only=True)
     
     class Meta:
         model = Conversation
-        fields = ['id', 'title', 'subject', 'class_level', 'message_count', 'is_active', 'created_at', 'updated_at', 'last_message_preview']
+        fields = ['id', 'title', 'subject', 'class_level', 'message_count', 'is_active', 'is_soft_deleted', 'created_at', 'updated_at', 'last_message_preview']
     
     def get_last_message_preview(self, obj):
         last_msg = obj.messages.order_by('-created_at').first()
@@ -22,10 +23,11 @@ class ConversationListSerializer(serializers.ModelSerializer):
 
 class ConversationDetailSerializer(serializers.ModelSerializer):
     messages = MessageSerializer(many=True, read_only=True)
+    is_soft_deleted = serializers.BooleanField(source='is_deleted', read_only=True)
     
     class Meta:
         model = Conversation
-        fields = ['id', 'title', 'subject', 'class_level', 'system_context', 'messages', 'message_count', 'is_active', 'created_at', 'updated_at']
+        fields = ['id', 'title', 'subject', 'class_level', 'system_context', 'messages', 'message_count', 'is_active', 'is_soft_deleted', 'deleted_at', 'created_at', 'updated_at']
 
 class CreateConversationSerializer(serializers.ModelSerializer):
     class Meta:
@@ -56,7 +58,8 @@ class SendMessageSerializer(serializers.Serializer):
     
     def validate_conversation_id(self, value):
         try:
-            conversation = Conversation.objects.get(id=value)
+            # Only allow sending messages to active (not soft-deleted) conversations
+            conversation = Conversation.objects.get(id=value, is_active=True, is_deleted=False)
             return value
         except Conversation.DoesNotExist:
-            raise serializers.ValidationError("Conversation not found")
+            raise serializers.ValidationError("Conversation not found or has been deleted")

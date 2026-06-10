@@ -5,138 +5,113 @@ FILE: models.py
 
 import uuid
 from django.db import models
-from django.contrib.auth.models import AbstractUser
-from .managers import CustomUserManager
+from django.conf import settings
+from tenants.models import TenantAwareModel
 
-class School(models.Model):
-    """
-    Represents a Tenant in the multi-tenant architecture.
-    """
+class Conversation(TenantAwareModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=255)
-    subdomain = models.CharField(max_length=100, unique=True, db_index=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='tutor_conversations')
+    student_profile = models.ForeignKey('profiles.StudentProfile', on_delete=models.SET_NULL, null=True, blank=True, related_name='tutor_conversations')
+    title = models.CharField(max_length=200)
+    subject = models.CharField(max_length=100, blank=True, null=True)
+    class_level = models.CharField(max_length=50, blank=True, null=True)
+    system_context = models.TextField(blank=True, null=True)
     is_active = models.BooleanField(default=True)
+    message_count = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
-    def __str__(self):
-        return f"{self.name} ({self.subdomain})"
-
-class TenantAwareModel(models.Model):
-    """
-    Abstract base class. Any model inheriting from this will strictly 
-    belong to a specific school (Tenant).
-    """
-    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="%(app_label)s_%(class)s_set")
-
-    class Meta:
-        abstract = True
-
-class User(AbstractUser):
-    """
-    Custom User model using UUIDs and Email for authentication.
-    Notice it does NOT inherit from TenantAwareModel directly because 
-    Global Admins (Superusers) might not belong to any single school.
-    """
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    username = None  # Remove the username field entirely
-    email = models.EmailField('email address', unique=True)
     
-    # Nullable so Global Admins don't need a school, but regular users will.
-    school = models.ForeignKey(
-        School, 
-        on_delete=models.CASCADE, 
-        null=True, 
-        blank=True, 
-        related_name='users'
-    )
-
-    USERNAME_FIELD = 'email'
-    REQUIRED_FIELDS = [] # Email & Password are required by default
-
-    objects = CustomUserManager()
-
-    def has_perm(self, perm, obj=None):
-        """
-        BRIDGE: Routes Django Admin permission checks to our custom RBAC engine.
-        """
-        if self.is_superuser:
-            return True
-            
-        # 1. Check standard Django permissions first
-        if super().has_perm(perm, obj):
-            return True
-            
-        # 2. Check our Custom UserRole mappings
-        # Django Admin asks for permissions in this format: "app_label.action_modelname"
-        # Example: "operations.view_attendance" or "operations.add_studentgrade"
-        if self.school and hasattr(self, 'user_roles'):
-            return self.user_roles.filter(
-                school=self.school,
-                role__permissions__codename=perm
-            ).exists()
-            
-        return False
-
-    def has_module_perms(self, app_label):
-        """
-        BRIDGE: Determines if the user can see the App module in the Admin sidebar.
-        """
-        if self.is_superuser:
-            return True
-            
-        if super().has_module_perms(app_label):
-            return True
-            
-        # If our custom RBAC grants ANY permission starting with the app_label, 
-        # show the module in the Admin sidebar.
-        if self.school and hasattr(self, 'user_roles'):
-            return self.user_roles.filter(
-                school=self.school,
-                role__permissions__codename__startswith=f"{app_label}."
-            ).exists()
-            
-        return False
-
+    class Meta:
+        ordering = ['-updated_at']
+    
     def __str__(self):
-        return self.email
+        return f"{self.user.email}: {self.title[:50]}"
+
+class Message(TenantAwareModel):
+    ROLE_CHOICES = [('user', 'User'), ('assistant', 'AI Assistant'), ('system', 'System')]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES)
+    content = models.TextField()
+    tokens_used = models.IntegerField(default=0)
+    model_used = models.CharField(max_length=50, default='deepseek-chat', blank=True)
+    is_responded = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['created_at']
+    
+    def __str__(self):
+        return f"{self.role}: {self.content[:50]}..."
+
 
 ================================================================================
 FILE: serializers.py
 ================================================================================
 
 from rest_framework import serializers
-from django.contrib.auth import get_user_model
+from .models import Conversation, Message
 
-User = get_user_model()
-
-class UserSerializer(serializers.ModelSerializer):
-    school_name = serializers.CharField(source='school.name', read_only=True)
-    school_subdomain = serializers.CharField(source='school.subdomain', read_only=True)
-    
-    # Add a write-only password field so users can be created securely via the API
-    password = serializers.CharField(write_only=True, required=False, style={'input_type': 'password'})
-
+class MessageSerializer(serializers.ModelSerializer):
     class Meta:
-        model = User
-        fields = ['id', 'email', 'password', 'first_name', 'last_name', 'school', 'school_name', 'school_subdomain', 'is_staff']
-        read_only_fields = ['id', 'school', 'is_staff']
+        model = Message
+        fields = ['id', 'role', 'content', 'tokens_used', 'model_used', 'created_at']
+        read_only_fields = ['id', 'created_at']
 
+class ConversationListSerializer(serializers.ModelSerializer):
+    last_message_preview = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Conversation
+        fields = ['id', 'title', 'subject', 'class_level', 'message_count', 'is_active', 'created_at', 'updated_at', 'last_message_preview']
+    
+    def get_last_message_preview(self, obj):
+        last_msg = obj.messages.order_by('-created_at').first()
+        if last_msg:
+            return last_msg.content[:100]
+        return "No messages yet"
+
+class ConversationDetailSerializer(serializers.ModelSerializer):
+    messages = MessageSerializer(many=True, read_only=True)
+    
+    class Meta:
+        model = Conversation
+        fields = ['id', 'title', 'subject', 'class_level', 'system_context', 'messages', 'message_count', 'is_active', 'created_at', 'updated_at']
+
+class CreateConversationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Conversation
+        fields = ['id', 'title', 'subject', 'class_level', 'system_context', 'message_count', 'is_active', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'message_count', 'is_active', 'created_at', 'updated_at']
+    
     def create(self, validated_data):
-        password = validated_data.pop('password', None)
-        user = super().create(validated_data)
-        if password:
-            user.set_password(password)
-            user.save()
-        return user
+        request = self.context.get('request')
+        validated_data['user'] = request.user
+        validated_data['school'] = request.user.school
+        
+        # Auto-assign student profile if exists
+        if hasattr(request.user, 'student_profile'):
+            validated_data['student_profile'] = request.user.student_profile
+        
+        # Generate default system context if not provided
+        if not validated_data.get('system_context'):
+            topic = validated_data.get('title', 'general')
+            subject = validated_data.get('subject', '')
+            validated_data['system_context'] = f"You are an AI tutor helping with {topic}. Subject: {subject}. Be patient and explain concepts clearly step by step."
+        
+        return super().create(validated_data)
 
-    def update(self, instance, validated_data):
-        password = validated_data.pop('password', None)
-        user = super().update(instance, validated_data)
-        if password:
-            user.set_password(password)
-            user.save()
-        return user
+class SendMessageSerializer(serializers.Serializer):
+    conversation_id = serializers.UUIDField()
+    message = serializers.CharField(max_length=5000, min_length=1)
+    
+    def validate_conversation_id(self, value):
+        try:
+            conversation = Conversation.objects.get(id=value)
+            return value
+        except Conversation.DoesNotExist:
+            raise serializers.ValidationError("Conversation not found")
+
 
 ================================================================================
 FILE: __init__.py
@@ -150,9 +125,9 @@ FILE: apps.py
 
 from django.apps import AppConfig
 
-
-class TenantsConfig(AppConfig):
-    name = 'tenants'
+class TutorConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'tutor'
 
 
 ================================================================================
@@ -160,74 +135,24 @@ FILE: admin.py
 ================================================================================
 
 from django.contrib import admin
-from django.contrib.auth.admin import UserAdmin
-from django.contrib.auth.forms import UserCreationForm, UserChangeForm
-from .models import School, User
+from .models import Conversation, Message
 
-class TenantAwareModelAdmin(admin.ModelAdmin):
-    """
-    Base Admin class to ensure non-superusers (like Teachers) 
-    only see their own school's data in the Django Admin panel.
-    """
-    def get_queryset(self, request):
-        qs = super().get_queryset(request)
-        if request.user.is_superuser:
-            return qs
-        if request.user.school:
-            return qs.filter(school=request.user.school)
-        return qs.none()
+@admin.register(Conversation)
+class ConversationAdmin(admin.ModelAdmin):
+    list_display = ('title', 'user', 'subject', 'message_count', 'is_active', 'created_at')
+    list_filter = ('is_active', 'subject')
+    search_fields = ('title', 'user__email')
 
-    def save_model(self, request, obj, form, change):
-        # Auto-assign the teacher's school to the object being created
-        if not change and hasattr(obj, 'school') and getattr(obj, 'school', None) is None:
-            if request.user.school:
-                obj.school = request.user.school
-        super().save_model(request, obj, form, change)
-
-class CustomUserCreationForm(UserCreationForm):
-    class Meta:
-        model = User
-        fields = ('email', 'school')
-
-class CustomUserChangeForm(UserChangeForm):
-    class Meta:
-        model = User
-        fields = ('email', 'school')
-
-@admin.register(School)
-class SchoolAdmin(admin.ModelAdmin):
-    list_display = ('name', 'subdomain', 'is_active', 'created_at')
-    search_fields = ('name', 'subdomain')
-    list_filter = ('is_active',)
-
-@admin.register(User)
-class CustomUserAdmin(UserAdmin):
-    add_form = CustomUserCreationForm
-    form = CustomUserChangeForm
-
-    # We must override fieldsets since we removed the 'username' field
-    ordering = ('email',)
-    list_display = ('email', 'first_name', 'last_name', 'school', 'is_staff')
-    search_fields = ('email', 'first_name', 'last_name')
-    list_filter = ('is_staff', 'is_superuser', 'is_active', 'school')
+@admin.register(Message)
+class MessageAdmin(admin.ModelAdmin):
+    list_display = ('conversation', 'role', 'content_preview', 'created_at')
+    list_filter = ('role',)
+    search_fields = ('content',)
     
-    fieldsets = (
-        (None, {'fields': ('email', 'password')}),
-        ('Personal info', {'fields': ('first_name', 'last_name', 'school')}),
-        ('Permissions', {
-            'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions'),
-        }),
-        ('Important dates', {'fields': ('last_login', 'date_joined')}),
-    )
+    def content_preview(self, obj):
+        return obj.content[:100] + "..." if len(obj.content) > 100 else obj.content
+    content_preview.short_description = 'Content'
 
-    # Override the layout for the "Add User" page
-    # Must use password1 and password2 as they are explicitly named in UserCreationForm
-    add_fieldsets = (
-        (None, {
-            'classes': ('wide',),
-            'fields': ('email', 'school', 'password1', 'password2'),
-        }),
-    )
 
 ================================================================================
 FILE: tests.py
@@ -244,170 +169,123 @@ FILE: urls.py
 
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
-    TokenRefreshView,
-)
-from .views import CurrentUserView, UserViewSet
+from .views import ConversationViewSet
 
 router = DefaultRouter()
-router.register(r'users', UserViewSet, basename='user')
+router.register(r'conversations', ConversationViewSet, basename='conversation')
 
 urlpatterns = [
-    # JWT Authentication Endpoints
-    path('auth/login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
-    
-    # Custom User Endpoints
-    path('auth/me/', CurrentUserView.as_view(), name='current_user'),
-    
-    # Tenant User CRUD Endpoints (Registers /users/)
     path('', include(router.urls)),
 ]
+
 
 ================================================================================
 FILE: views.py
 ================================================================================
 
-from rest_framework import viewsets, generics
+from rest_framework import viewsets, status
+from rest_framework.response import Response
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.exceptions import PermissionDenied, ValidationError
-from django.db.models.query import QuerySet
-from django.contrib.auth import get_user_model
-from drf_spectacular.utils import extend_schema, extend_schema_view
-from .serializers import UserSerializer
-
-User = get_user_model()
-
-class TenantAwareModelViewSet(viewsets.ModelViewSet):
-    """
-    Base ViewSet that automatically filters all database queries by request.user.school.
-    All future Module ViewSets (StudentProfileViewSet, AttendanceViewSet, InvoiceViewSet) 
-    MUST inherit from this to guarantee strict data isolation across the SaaS.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        """
-        Intercept the default DRF queryset and append the tenant filter dynamically.
-        """
-        assert self.queryset is not None, (
-            "'%s' should either include a `queryset` attribute, "
-            "or override the `get_queryset()` method."
-            % self.__class__.__name__
-        )
-
-        queryset = self.queryset
-        
-        # FIX: Check against the actual Django QuerySet class
-        if isinstance(queryset, QuerySet):
-            queryset = queryset.all()
-
-        user = self.request.user
-
-        # Strict Isolation Rule: If the user belongs to a school, only return that school's data.
-        if hasattr(user, 'school') and user.school:
-            return queryset.filter(school=user.school)
-            
-        # Security Fallback: If a user somehow has no school assigned, 
-        # return an empty queryset to prevent cross-tenant data leaks.
-        return queryset.none()
-
-    def perform_create(self, serializer):
-        """
-        Automatically inject the user's school into the created database row
-        so the frontend doesn't have to manually pass a school_id in the payload.
-        """
-        user = self.request.user
-        
-        if not hasattr(user, 'school') or not user.school:
-            raise PermissionDenied("You must be assigned to a school to create records.")
-            
-        # DYNAMIC ANTI-HIJACKING FIX: 
-        # Iterate over all incoming relational fields (user, parent, student, etc.)
-        # and ensure they belong to the admin's school.
-        for field_name, value in serializer.validated_data.items():
-            if hasattr(value, 'school') and value.school != user.school:
-                raise ValidationError({field_name: f"This {field_name} does not belong to your school."})
-            
-        serializer.save(school=user.school)
-
-    def perform_update(self, serializer):
-        """
-        Intercept updates to prevent maliciously re-assigning records to users 
-        or objects from other schools.
-        """
-        user = self.request.user
-
-        # DYNAMIC ANTI-HIJACKING FIX
-        for field_name, value in serializer.validated_data.items():
-            if hasattr(value, 'school') and value.school != user.school:
-                raise ValidationError({field_name: f"This {field_name} does not belong to your school."})
-
-        serializer.save(school=user.school)
-
-
-class CurrentUserView(generics.RetrieveAPIView):
-    """
-    GET /auth/me/
-    Returns the currently authenticated user's details based on their JWT.
-    """
-    serializer_class = UserSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_object(self):
-        return self.request.user
-
-# --- NEW USER CRUD ENDPOINTS ---
-
-@extend_schema_view(
-    list=extend_schema(summary="List all users in the school"),
-    create=extend_schema(summary="Create a new user"),
-    retrieve=extend_schema(summary="Retrieve user details"),
-    update=extend_schema(summary="Update a user"),
-    partial_update=extend_schema(summary="Partially update a user"),
-    destroy=extend_schema(summary="Delete a user"),
+from django.db import transaction
+from tenants.views import TenantAwareModelViewSet
+from .models import Conversation, Message
+from .serializers import (
+    ConversationListSerializer, ConversationDetailSerializer,
+    CreateConversationSerializer, SendMessageSerializer, MessageSerializer
 )
-class UserViewSet(TenantAwareModelViewSet):
-    """
-    CRUD endpoints for Tenant Users. 
-    Automatically isolated to the requester's school.
-    """
-    queryset = User.objects.select_related('school').all()
-    serializer_class = UserSerializer
+from .services.deepseek_client import deepseek_client
 
-================================================================================
-FILE: managers.py
-================================================================================
+class ConversationViewSet(TenantAwareModelViewSet):
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        return Conversation.objects.filter(
+            user=self.request.user,
+            school=self.request.user.school
+        )
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return CreateConversationSerializer
+        elif self.action == 'retrieve':
+            return ConversationDetailSerializer
+        return ConversationListSerializer
+    
+    def perform_create(self, serializer):
+        serializer.save(school=self.request.user.school, user=self.request.user)
+    
+    @action(detail=False, methods=['post'], url_path='chat')
+    def chat(self, request):
+        serializer = SendMessageSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        
+        conversation_id = serializer.validated_data['conversation_id']
+        user_message = serializer.validated_data['message']
+        conversation = Conversation.objects.get(id=conversation_id)
+        
+        try:
+            with transaction.atomic():
+                # 1. Save user message
+                user_msg = Message.objects.create(
+                    school=request.user.school,
+                    conversation=conversation,
+                    role='user',
+                    content=user_message
+                )
+                
+                # 2. Get conversation context for AI
+                context = []
+                
+                # Add system context if exists
+                if conversation.system_context:
+                    context.append({
+                        "role": "system",
+                        "content": conversation.system_context
+                    })
+                
+                # Add last 10 messages for context (to save tokens)
+                recent_messages = conversation.messages.order_by('-created_at')[:10]
+                for msg in reversed(recent_messages):
+                    context.append({
+                        "role": msg.role,
+                        "content": msg.content
+                    })
+                
+                # 3. Get AI response from DeepSeek
+                ai_response = deepseek_client.get_tutor_response(
+                    conversation_context=context,
+                    user_message=user_message,
+                    temperature=0.7
+                )
+                
+                # 4. Save AI response
+                assistant_msg = Message.objects.create(
+                    school=request.user.school,
+                    conversation=conversation,
+                    role='assistant',
+                    content=ai_response['content'],
+                    tokens_used=ai_response['tokens_used'],
+                    model_used=ai_response['model']
+                )
+                
+                # 5. Update user message as responded
+                user_msg.is_responded = True
+                user_msg.save(update_fields=['is_responded'])
+                
+                # 6. Update conversation message count
+                conversation.message_count = conversation.messages.count()
+                conversation.save(update_fields=['message_count'])
+                
+                # 7. Return the AI response
+                return Response(MessageSerializer(assistant_msg).data, status=status.HTTP_200_OK)
+                
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to get AI response: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
-from django.contrib.auth.models import BaseUserManager
-from django.utils.translation import gettext_lazy as _
-
-class CustomUserManager(BaseUserManager):
-    """
-    Custom user model manager where email is the unique identifiers
-    for authentication instead of usernames.
-    """
-    def create_user(self, email, password, **extra_fields):
-        if not email:
-            raise ValueError(_('The Email must be set'))
-        email = self.normalize_email(email)
-        user = self.model(email=email, **extra_fields)
-        user.set_password(password)
-        user.save()
-        return user
-
-    def create_superuser(self, email, password, **extra_fields):
-        extra_fields.setdefault('is_staff', True)
-        extra_fields.setdefault('is_superuser', True)
-        extra_fields.setdefault('is_active', True)
-
-        if extra_fields.get('is_staff') is not True:
-            raise ValueError(_('Superuser must have is_staff=True.'))
-        if extra_fields.get('is_superuser') is not True:
-            raise ValueError(_('Superuser must have is_superuser=True.'))
-
-        return self.create_user(email, password, **extra_fields)
 
 ================================================================================
 FILE: migrations/__init__.py
@@ -419,11 +297,11 @@ FILE: migrations/__init__.py
 FILE: migrations/0001_initial.py
 ================================================================================
 
-# Generated by Django 6.0.3 on 2026-03-26 04:55
+# Generated by Django 6.0.6 on 2026-06-10 09:28
 
 import django.db.models.deletion
-import django.utils.timezone
 import uuid
+from django.conf import settings
 from django.db import migrations, models
 
 
@@ -432,43 +310,135 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ('auth', '0012_alter_user_first_name_max_length'),
+        ('profiles', '0002_parentstudentmapping'),
+        ('tenants', '0001_initial'),
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
     operations = [
         migrations.CreateModel(
-            name='School',
+            name='Conversation',
             fields=[
                 ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('name', models.CharField(max_length=255)),
-                ('subdomain', models.CharField(db_index=True, max_length=100, unique=True)),
+                ('title', models.CharField(max_length=200)),
+                ('subject', models.CharField(blank=True, max_length=100, null=True)),
+                ('class_level', models.CharField(blank=True, max_length=50, null=True)),
+                ('system_context', models.TextField(blank=True, null=True)),
                 ('is_active', models.BooleanField(default=True)),
+                ('message_count', models.IntegerField(default=0)),
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
-            ],
-        ),
-        migrations.CreateModel(
-            name='User',
-            fields=[
-                ('password', models.CharField(max_length=128, verbose_name='password')),
-                ('last_login', models.DateTimeField(blank=True, null=True, verbose_name='last login')),
-                ('is_superuser', models.BooleanField(default=False, help_text='Designates that this user has all permissions without explicitly assigning them.', verbose_name='superuser status')),
-                ('first_name', models.CharField(blank=True, max_length=150, verbose_name='first name')),
-                ('last_name', models.CharField(blank=True, max_length=150, verbose_name='last name')),
-                ('is_staff', models.BooleanField(default=False, help_text='Designates whether the user can log into this admin site.', verbose_name='staff status')),
-                ('is_active', models.BooleanField(default=True, help_text='Designates whether this user should be treated as active. Unselect this instead of deleting accounts.', verbose_name='active')),
-                ('date_joined', models.DateTimeField(default=django.utils.timezone.now, verbose_name='date joined')),
-                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('email', models.EmailField(max_length=254, unique=True, verbose_name='email address')),
-                ('groups', models.ManyToManyField(blank=True, help_text='The groups this user belongs to. A user will get all permissions granted to each of their groups.', related_name='user_set', related_query_name='user', to='auth.group', verbose_name='groups')),
-                ('user_permissions', models.ManyToManyField(blank=True, help_text='Specific permissions for this user.', related_name='user_set', related_query_name='user', to='auth.permission', verbose_name='user permissions')),
-                ('school', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.CASCADE, related_name='users', to='tenants.school')),
+                ('school', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='%(app_label)s_%(class)s_set', to='tenants.school')),
+                ('student_profile', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='tutor_conversations', to='profiles.studentprofile')),
+                ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='tutor_conversations', to=settings.AUTH_USER_MODEL)),
             ],
             options={
-                'verbose_name': 'user',
-                'verbose_name_plural': 'users',
-                'abstract': False,
+                'ordering': ['-updated_at'],
+            },
+        ),
+        migrations.CreateModel(
+            name='Message',
+            fields=[
+                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ('role', models.CharField(choices=[('user', 'User'), ('assistant', 'AI Assistant'), ('system', 'System')], max_length=20)),
+                ('content', models.TextField()),
+                ('tokens_used', models.IntegerField(default=0)),
+                ('model_used', models.CharField(blank=True, default='deepseek-chat', max_length=50)),
+                ('is_responded', models.BooleanField(default=False)),
+                ('created_at', models.DateTimeField(auto_now_add=True)),
+                ('conversation', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='messages', to='tutor.conversation')),
+                ('school', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='%(app_label)s_%(class)s_set', to='tenants.school')),
+            ],
+            options={
+                'ordering': ['created_at'],
             },
         ),
     ]
+
+
+================================================================================
+FILE: services/__init__.py
+================================================================================
+
+from .deepseek_client import deepseek_client
+
+__all__ = ['deepseek_client']
+
+
+================================================================================
+FILE: services/deepseek_client.py
+================================================================================
+
+import os
+import requests
+from django.conf import settings
+
+class DeepSeekClient:
+    """
+    Client for DeepSeek API (OpenAI-compatible)
+    """
+    
+    def __init__(self):
+        self.api_key = os.getenv('DEEPSEEK_API_KEY')
+        self.base_url = "https://api.deepseek.com/v1"
+        
+        if not self.api_key:
+            raise ValueError("DEEPSEEK_API_KEY not found in environment variables")
+    
+    def chat_completion(self, messages, temperature=0.7, max_tokens=2000):
+        """
+        Send chat completion request to DeepSeek API
+        """
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"DeepSeek API error: {str(e)}")
+    
+    def get_tutor_response(self, conversation_context, user_message, temperature=0.7):
+        """
+        Get AI tutor response for a user message
+        """
+        # Prepare messages with context
+        messages = conversation_context.copy()
+        messages.append({
+            "role": "user",
+            "content": user_message
+        })
+        
+        # Get response from API
+        response = self.chat_completion(messages, temperature=temperature)
+        
+        # Extract the assistant's reply
+        assistant_message = response['choices'][0]['message']['content']
+        tokens_used = response.get('usage', {}).get('total_tokens', 0)
+        
+        return {
+            "content": assistant_message,
+            "tokens_used": tokens_used,
+            "model": "deepseek-chat",
+            "raw_response": response
+        }
+
+# Create singleton instance
+deepseek_client = DeepSeekClient()
 

@@ -11,7 +11,9 @@ class Conversation(TenantAwareModel):
     subject = models.CharField(max_length=100, blank=True, null=True)
     class_level = models.CharField(max_length=50, blank=True, null=True)
     system_context = models.TextField(blank=True, null=True)
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True)  # False = soft deleted
+    is_deleted = models.BooleanField(default=False)  # New: Track soft delete separately
+    deleted_at = models.DateTimeField(null=True, blank=True)  # When it was soft deleted
     message_count = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -21,6 +23,20 @@ class Conversation(TenantAwareModel):
     
     def __str__(self):
         return f"{self.user.email}: {self.title[:50]}"
+    
+    def soft_delete(self):
+        """Soft delete the conversation"""
+        self.is_active = False
+        self.is_deleted = True
+        self.deleted_at = timezone.now()
+        self.save(update_fields=['is_active', 'is_deleted', 'deleted_at'])
+    
+    def restore(self):
+        """Restore a soft-deleted conversation"""
+        self.is_active = True
+        self.is_deleted = False
+        self.deleted_at = None
+        self.save(update_fields=['is_active', 'is_deleted', 'deleted_at'])
 
 class Message(TenantAwareModel):
     ROLE_CHOICES = [('user', 'User'), ('assistant', 'AI Assistant'), ('system', 'System')]
