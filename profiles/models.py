@@ -32,6 +32,7 @@ class StudentProfile(BaseProfile):
     is_archived = models.BooleanField(default=False)
 
     class Meta:
+        ordering = ['-id']
         # Ensures two different schools can use the same enrollment number, 
         # but within a single school, it must be unique.
         constraints = [
@@ -49,6 +50,7 @@ class TeacherProfile(BaseProfile):
     joining_date = models.DateField(blank=True, null=True)
 
     class Meta:
+        ordering = ['-id']
         constraints = [
             models.UniqueConstraint(fields=['school', 'employee_id'], name='unique_school_employee_id')
         ]
@@ -61,6 +63,9 @@ class ParentProfile(BaseProfile):
     """Profile specifically for Parents/Guardians."""
     occupation = models.CharField(max_length=100, blank=True, null=True)
     emergency_contact_number = models.CharField(max_length=20, blank=True, null=True)
+
+    class Meta:
+        ordering = ['-id']
 
     def __str__(self):
         return f"{self.user.first_name} {self.user.last_name} (Parent)"
@@ -81,6 +86,7 @@ class ParentStudentMapping(TenantAwareModel):
     can_pay_fees = models.BooleanField(default=True)
 
     class Meta:
+        ordering = ['-id']
         # A parent shouldn't be mapped to the exact same student twice
         constraints = [
             models.UniqueConstraint(fields=['parent', 'student'], name='unique_parent_student_mapping')
