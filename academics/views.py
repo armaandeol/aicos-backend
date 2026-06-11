@@ -6,10 +6,11 @@ from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
 from tenants.views import TenantAwareModelViewSet
-from .models import StudentEnrollment, TeacherAssignment, AcademicYear, ClassLevel, Section, Subject
+from .models import StudentEnrollment, TeacherAssignment, AcademicYear, ClassLevel, Section, Subject, SavedAIContent
 from .serializers import (
     StudentEnrollmentSerializer, TeacherAssignmentSerializer, BulkPromotionSerializer,
-    AcademicYearSerializer, ClassLevelSerializer, SectionSerializer, SubjectSerializer
+    AcademicYearSerializer, ClassLevelSerializer, SectionSerializer, SubjectSerializer,
+    SavedAIContentSerializer
 )
 
 # --- NEW ACADEMIC BASE VIEWSETS ---
@@ -161,3 +162,34 @@ class TeacherAssignmentViewSet(TenantAwareModelViewSet):
             qs = qs.filter(academic_year__end_date__lt=today)
 
         return qs
+
+@extend_schema_view(
+    list=extend_schema(summary="List saved AI content"),
+    create=extend_schema(summary="Save new AI content"),
+    retrieve=extend_schema(summary="Retrieve saved AI content details"),
+    update=extend_schema(summary="Update saved AI content"),
+    partial_update=extend_schema(summary="Partially update saved AI content"),
+    destroy=extend_schema(summary="Delete saved AI content"),
+)
+class SavedAIContentViewSet(TenantAwareModelViewSet):
+    queryset = SavedAIContent.objects.all()
+    serializer_class = SavedAIContentSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        
+        if hasattr(self.request.user, 'teacherprofile'):
+            qs = qs.filter(teacher=self.request.user.teacherprofile)
+            
+        content_type = self.request.query_params.get('content_type', None)
+        if content_type:
+            qs = qs.filter(content_type__iexact=content_type)
+            
+        return qs
+
+    def perform_create(self, serializer):
+        if hasattr(self.request.user, 'teacherprofile'):
+            serializer.save(teacher=self.request.user.teacherprofile, school=self.request.user.school)
+        else:
+            from rest_framework import serializers
+            raise serializers.ValidationError({"detail": "User is not a teacher."})
