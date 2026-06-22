@@ -2,21 +2,23 @@ from rest_framework import serializers
 from .models import StudentProfile, TeacherProfile, ParentProfile, ParentStudentMapping
 
 class StudentProfileSerializer(serializers.ModelSerializer):
-    # 1. Define these fields explicitly WITHOUT a 'source' to bypass the UUID validation bug
+    # Define these fields explicitly to handle User model fields
     first_name = serializers.CharField(required=False)
     last_name = serializers.CharField(required=False)
     email = serializers.EmailField(required=False)
     
-    # FIX 1: Removed the read_only=True overrides for address, phone_number, and blood_group.
-    # The ModelSerializer will now automatically pick them up as writable fields.
-
+    # Profile fields - writable (required=False for partial updates)
+    address = serializers.CharField(required=False)
+    phone_number = serializers.CharField(required=False)
+    blood_group = serializers.CharField(required=False)
+    
     class Meta:
         model = StudentProfile
         fields = '__all__'
         read_only_fields = ('school', 'id')
 
-    # FIX 2: Properly indented to_representation so it belongs inside the class
     def to_representation(self, instance):
+        """Populate User fields when sending response"""
         representation = super().to_representation(instance)
         if instance.user:
             representation['first_name'] = instance.user.first_name
@@ -24,14 +26,12 @@ class StudentProfileSerializer(serializers.ModelSerializer):
             representation['email'] = instance.user.email
         return representation
 
-    # FIX 3: Properly indented update so it belongs inside the class
     def update(self, instance, validated_data):
-        # Pop the fields out of the payload before Django tries to save them to the Profile model
+        """Handle User fields when updating"""
         first_name = validated_data.pop('first_name', None)
         last_name = validated_data.pop('last_name', None)
         email = validated_data.pop('email', None)
 
-        # Save them directly to the underlying User model
         user = instance.user
         if user:
             if first_name is not None:
@@ -46,7 +46,7 @@ class StudentProfileSerializer(serializers.ModelSerializer):
 
 
 class TeacherProfileSerializer(serializers.ModelSerializer):
-    # Bypass the read-only blocks
+    # User fields
     first_name = serializers.CharField(required=False)
     last_name = serializers.CharField(required=False)
     email = serializers.EmailField(required=False)
@@ -56,8 +56,8 @@ class TeacherProfileSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('school', 'id')
 
-    # Send the user data to React on GET
     def to_representation(self, instance):
+        """Populate User fields when sending response"""
         representation = super().to_representation(instance)
         if instance.user:
             representation['first_name'] = instance.user.first_name
@@ -66,8 +66,8 @@ class TeacherProfileSerializer(serializers.ModelSerializer):
             representation['is_archived'] = not instance.user.is_active 
         return representation
 
-    # Intercept and save the user data on PATCH
     def update(self, instance, validated_data):
+        """Handle User fields when updating"""
         first_name = validated_data.pop('first_name', None)
         last_name = validated_data.pop('last_name', None)
         email = validated_data.pop('email', None)
@@ -110,4 +110,3 @@ class ParentStudentMappingSerializer(serializers.ModelSerializer):
         model = ParentStudentMapping
         fields = '__all__'
         read_only_fields = ('school', 'id')
-        
