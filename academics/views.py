@@ -4,6 +4,7 @@ from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.pagination import LimitOffsetPagination
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
 from tenants.views import TenantAwareModelViewSet
@@ -259,6 +260,7 @@ class TeacherAssignmentViewSet(TenantAwareModelViewSet):
 class SavedAIContentViewSet(TenantAwareModelViewSet):
     queryset = SavedAIContent.objects.all()
     serializer_class = SavedAIContentSerializer
+    pagination_class = LimitOffsetPagination
 
     # --- ADDED FOR SEARCH ---
     filter_backends = [filters.SearchFilter]
