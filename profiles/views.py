@@ -1,3 +1,4 @@
+# profiles/views.py
 from rest_framework import viewsets, views, response, filters, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
@@ -10,7 +11,8 @@ from .serializers import (
     StudentProfileSerializer, TeacherProfileSerializer,
     ParentProfileSerializer, ParentStudentMappingSerializer
 )
-from academics.models import StudentEnrollment
+from academics.models import StudentEnrollment, Subject
+from academics.serializers import SubjectSerializer
 from operations.models import Attendance, StudentGrade, Assignment
 from django.db.models import Count, Avg, Q
 from django.utils import timezone
@@ -116,6 +118,57 @@ class StudentProfileViewSet(TenantAwareModelViewSet):
             })
 
         return Response({"parents": data})
+
+    @action(detail=False, methods=['get'], url_path='me/subjects')
+    def my_subjects(self, request):
+        """
+        GET /api/v1/profiles/students/me/subjects/
+        Returns all subjects for the current student's class level.
+        """
+        try:
+            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {"detail": "Student profile not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get current enrollment
+        enrollment = StudentEnrollment.objects.filter(
+            student=student,
+            school=request.user.school
+        ).order_by('-academic_year__start_date').first()
+        
+        if not enrollment:
+            return Response({
+                "count": 0,
+                "results": [],
+                "detail": "No enrollment found for this student."
+            }, status=status.HTTP_200_OK)
+        
+        # Get subjects for this class level
+        subjects = Subject.objects.filter(
+            class_levels=enrollment.class_level,
+            school=request.user.school
+        ).order_by('name')
+        
+        serializer = SubjectSerializer(subjects, many=True)
+        return Response({
+            "count": subjects.count(),
+            "results": serializer.data,
+            "class_level": {
+                "id": str(enrollment.class_level.id),
+                "name": enrollment.class_level.name
+            },
+            "section": {
+                "id": str(enrollment.section.id),
+                "name": enrollment.section.name
+            },
+            "academic_year": {
+                "id": str(enrollment.academic_year.id),
+                "name": enrollment.academic_year.name
+            }
+        }, status=status.HTTP_200_OK)
 
 
 class TeacherProfileViewSet(TenantAwareModelViewSet):

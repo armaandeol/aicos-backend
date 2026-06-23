@@ -1,3 +1,4 @@
+# profiles/urls.py
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
@@ -34,6 +35,11 @@ urlpatterns = [
     
     # Student Dashboard
     path('students/dashboard/', StudentDashboardAPIView.as_view(), name='student-dashboard'),
+    
+    # ✅ NEW: Student Subjects Endpoint
+    # This uses the ViewSet's action, so it's automatically routed via the router
+    # The URL will be: /api/v1/profiles/students/me/subjects/
+    # No additional path needed here since it's registered via the router's @action decorator
     
     # Parent Dashboard & Child Management
     path('parents/dashboard/', ParentDashboardAPIView.as_view(), name='parent-dashboard'),
