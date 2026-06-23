@@ -1,4 +1,8 @@
 from django.db import transaction
+# operations/views.py - Add these imports at the top
+from django.conf import settings
+from datetime import datetime, timedelta
+from core.utils.r2_storage import r2_storage
 from rest_framework import viewsets, status, filters
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
@@ -7,19 +11,76 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from drf_spectacular.utils import extend_schema
 from django.db.models import Count, Avg, Q
 from django.utils import timezone
-from datetime import timedelta
+import uuid
+import os
 
 from tenants.views import TenantAwareModelViewSet
 from profiles.models import StudentProfile, ParentProfile, TeacherProfile
-from academics.models import StudentEnrollment, TeacherAssignment
+from academics.models import StudentEnrollment, TeacherAssignment, Subject, Section
 from accounts.permissions import IsStudent, IsTeacher, IsParent, IsTeacherOrStaff, IsParentOfStudent
-from .models import Attendance, Exam, StudentGrade, Assignment, StudentSubmission
+from .models import Attendance, Exam, StudentGrade, Assignment, StudentSubmission, PendingSubmission
 from .serializers import (
     AttendanceSerializer, BulkAttendanceSerializer,
     ExamSerializer, StudentGradeSerializer, BulkGradeSubmitSerializer,
     AssignmentSerializer, StudentSubmissionSerializer,
     StudentSubmissionCreateSerializer, AssignmentWithStatusSerializer,
 )
+from core.utils.r2_storage import r2_storage
+
+
+# --- HELPER FUNCTIONS ---
+
+def generate_submission_file_path(student_id, assignment_id, file_name):
+    """
+    Generate a clean, organized file path for a submission.
+    
+    Structure: submissions/{student_id}/{assignment_id}/{timestamp}_{uuid}.{ext}
+    
+    Args:
+        student_id (str): UUID of the student
+        assignment_id (str): UUID of the assignment
+        file_name (str): Original filename
+        
+    Returns:
+        str: Generated file path
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    extension = os.path.splitext(file_name)[1] if file_name else '.pdf'
+    unique_id = str(uuid.uuid4())
+    
+    # Clean the file_name to remove any path traversal or special chars
+    base_name = os.path.splitext(file_name)[0] if file_name else 'submission'
+    # Keep only alphanumeric and underscore/dash
+    clean_base = ''.join(c for c in base_name if c.isalnum() or c in '._-')
+    clean_base = clean_base[:50]  # Limit length
+    
+    return f"submissions/{student_id}/{assignment_id}/{timestamp}_{unique_id}{extension}"
+
+
+def generate_profile_picture_path(user_id, file_name):
+    """
+    Generate a clean, organized file path for a profile picture.
+    
+    Structure: profiles/pictures/{user_id}/{timestamp}_{uuid}.{ext}
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    extension = os.path.splitext(file_name)[1] if file_name else '.jpg'
+    unique_id = str(uuid.uuid4())
+    
+    return f"profiles/pictures/{user_id}/{timestamp}_{unique_id}{extension}"
+
+
+def generate_assignment_attachment_path(teacher_id, section_id, subject_id, file_name):
+    """
+    Generate a clean, organized file path for an assignment attachment.
+    
+    Structure: assignments/{teacher_id}/{section_id}/{subject_id}/{timestamp}_{uuid}.{ext}
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    extension = os.path.splitext(file_name)[1] if file_name else '.pdf'
+    unique_id = str(uuid.uuid4())
+    
+    return f"assignments/{teacher_id}/{section_id}/{subject_id}/{timestamp}_{unique_id}{extension}"
 
 
 # --- SHARED OWNERSHIP HELPERS ---
@@ -883,8 +944,7 @@ class StudentGradeViewSet(TenantAwareModelViewSet):
         assignment = TeacherAssignment.objects.filter(
             teacher=teacher,
             section_id=section_id,
-            school=request.user.school
-        ).first()
+            school=request.user.school        ).first()
 
         if not assignment:
             return Response(
@@ -1038,6 +1098,155 @@ class AssignmentViewSet(TenantAwareModelViewSet):
             assignments, many=True, context={'student_id': effective_student_id}
         )
         return Response({"count": assignments.count(), "results": serializer.data}, status=status.HTTP_200_OK)
+
+    # --- TEACHER ASSIGNMENT WITH FILE UPLOAD ---
+
+    @action(detail=False, methods=['post'], url_path='create-with-file')
+    def create_with_file(self, request):
+        """
+        POST /api/v1/operations/assignments/create-with-file/
+        
+        Step 1: Teacher creates assignment and gets upload URL for file
+        """
+        try:
+            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
+        except TeacherProfile.DoesNotExist:
+            return Response(
+                {"detail": "Teacher profile not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Validate basic assignment data
+        title = request.data.get('title')
+        description = request.data.get('description')
+        subject_id = request.data.get('subject_id')
+        section_id = request.data.get('section_id')
+        due_date = request.data.get('due_date')
+        file_name = request.data.get('file_name')
+        content_type = request.data.get('content_type', 'application/pdf')
+
+        if not all([title, subject_id, section_id, due_date]):
+            return Response(
+                {"detail": "title, subject_id, section_id, and due_date are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate subject and section
+        try:
+            subject = Subject.objects.get(id=subject_id, school=request.user.school)
+            section = Section.objects.get(id=section_id, school=request.user.school)
+        except (Subject.DoesNotExist, Section.DoesNotExist):
+            return Response(
+                {"detail": "Invalid subject or section."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Generate file path for assignment using helper
+        upload_data = None
+        file_path = None
+        
+        if file_name:
+            file_path = generate_assignment_attachment_path(teacher.id, section_id, subject_id, file_name)
+            
+            # Generate signed upload URL
+            upload_data = r2_storage.generate_upload_url(
+                file_path=file_path,
+                content_type=content_type,
+                expires_in=900  # 15 minutes
+            )
+
+        # Store pending assignment in session
+        request.session['pending_assignment'] = {
+            'title': title,
+            'description': description,
+            'subject_id': str(subject_id),
+            'section_id': str(section_id),
+            'due_date': due_date,
+            'teacher_id': str(teacher.id),
+            'file_path': file_path,
+            'file_name': file_name,
+        }
+
+        return Response({
+            "assignment_draft": {
+                "title": title,
+                "subject": subject.name,
+                "section": section.name,
+                "due_date": due_date
+            },
+            "upload": upload_data if upload_data else {
+                "message": "No file to upload"
+            },
+            "next_step": "upload_file" if upload_data else "create_assignment"
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='confirm-assignment-file')
+    def confirm_assignment_file(self, request):
+        """
+        POST /api/v1/operations/assignments/confirm-assignment-file/
+        
+        Step 2: After file upload, confirm and create the assignment
+        """
+        pending_assignment = request.session.get('pending_assignment')
+        
+        if not pending_assignment:
+            return Response(
+                {"detail": "No pending assignment found. Please start over."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Verify file was uploaded (if file was expected)
+        file_path = pending_assignment.get('file_path')
+        if file_path:
+            if not r2_storage.confirm_upload(file_path):
+                return Response(
+                    {"detail": "File upload could not be verified. Please try again."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Create the actual assignment
+        try:
+            teacher = TeacherProfile.objects.get(id=pending_assignment['teacher_id'])
+            subject = Subject.objects.get(id=pending_assignment['subject_id'])
+            section = Section.objects.get(id=pending_assignment['section_id'])
+        except (TeacherProfile.DoesNotExist, Subject.DoesNotExist, Section.DoesNotExist):
+            return Response(
+                {"detail": "Invalid teacher, subject, or section."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Create assignment
+        assignment = Assignment.objects.create(
+            school=request.user.school,
+            title=pending_assignment['title'],
+            description=pending_assignment['description'],
+            subject=subject,
+            section=section,
+            teacher=teacher,
+            due_date=pending_assignment['due_date'],
+        )
+
+        # Clear session
+        del request.session['pending_assignment']
+
+        # Generate view URL for the file (if any)
+        view_url = None
+        if file_path:
+            view_data = r2_storage.generate_view_url(file_path, expires_in=604800)  # 7 days
+            view_url = view_data['url']
+
+        return Response({
+            "detail": "Assignment created successfully",
+            "assignment": {
+                "id": str(assignment.id),
+                "title": assignment.title,
+                "subject": subject.name,
+                "section": section.name,
+                "due_date": assignment.due_date,
+                "file_path": file_path,
+                "view_url": view_url
+            }
+        }, status=status.HTTP_201_CREATED)
 
     # --- STUDENT ASSIGNMENT METHODS ---
 
@@ -1207,7 +1416,9 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
     def get_permissions(self):
         if self.action == 'submit':
             return [IsAuthenticated(), IsStudent()]
-        elif self.action in ['my_submissions', 'my_pending_submissions', 'my_assignment_submissions']:
+        elif self.action in ['initiate_upload', 'complete_upload', 'my_pending_drafts', 'cancel_draft']:
+            return [IsAuthenticated(), IsStudent()]
+        elif self.action in ['my_submissions', 'teacher_pending', 'teacher_assignment_submissions']:
             return [IsAuthenticated()]
         elif self.action in ['update', 'partial_update', 'destroy']:
             return [IsAuthenticated(), IsTeacher()]
@@ -1256,6 +1467,19 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
             assignment=assignment, student_id=own_student_id
         ).first()
 
+        # ✅ FIX: Generate organized file path BEFORE saving
+        file = request.FILES.get('file')
+        if file:
+            # Generate organized path using the helper
+            file_path = generate_submission_file_path(own_student_id, assignment_id, file.name)
+            # Store the path in the file field
+            # The file will be saved to Django's storage with this path
+            # We need to override the default upload behavior
+            from django.core.files.storage import default_storage
+            saved_path = default_storage.save(file_path, file)
+        else:
+            saved_path = None
+
         serializer = StudentSubmissionCreateSerializer(
             instance=existing, data=request.data, partial=bool(existing)
         )
@@ -1264,6 +1488,7 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
             school=request.user.school,
             student_id=own_student_id,
             assignment=assignment,
+            file=saved_path,  # Use the organized path
             status='Submitted',
         )
         return Response(serializer.data, status=status.HTTP_201_CREATED if not existing else status.HTTP_200_OK)
@@ -1278,67 +1503,365 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
 
         super().perform_update(serializer)
 
-    # --- STUDENT/PARENT SUBMISSION METHODS ---
+    # ============================================
+    # NEW: CLEAN UPLOAD FLOW
+    # ============================================
+
+    @action(detail=False, methods=['post'], url_path='initiate-upload')
+    def initiate_upload(self, request):
+        """
+        POST /api/v1/operations/submissions/initiate-upload/
+        
+        Step 1: Student initiates upload, gets signed URL and draft ID
+        
+        Request:
+        {
+            "assignment_id": "uuid",
+            "file_name": "syllabus.pdf",
+            "content_type": "application/pdf"
+        }
+        
+        Response:
+        {
+            "draft_id": "uuid",
+            "upload_url": "https://r2.signed.url",
+            "file_path": "submissions/{student_id}/{assignment_id}/{uuid}.pdf",
+            "expires_at": "2026-06-22T10:00:00Z",
+            "expires_in": 900,
+            "assignment": {
+                "id": "uuid",
+                "title": "Science Project",
+                "subject": "Biology"
+            }
+        }
+        """
+        # Check if user is a student
+        try:
+            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {"detail": "Only students can submit assignments."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        assignment_id = request.data.get('assignment_id')
+        file_name = request.data.get('file_name')
+        content_type = request.data.get('content_type', 'application/pdf')
+
+        if not assignment_id or not file_name:
+            return Response(
+                {"detail": "assignment_id and file_name are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            assignment = Assignment.objects.get(id=assignment_id, school=request.user.school)
+        except Assignment.DoesNotExist:
+            return Response(
+                {"detail": "Assignment not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if already submitted
+        if StudentSubmission.objects.filter(
+            assignment=assignment,
+            student=student
+        ).exists():
+            return Response(
+                {"detail": "You have already submitted this assignment."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Generate organized file path
+        file_path = generate_submission_file_path(student.id, assignment.id, file_name)
+
+        # Generate signed upload URL
+        upload_data = r2_storage.generate_upload_url(
+            file_path=file_path,
+            content_type=content_type,
+            expires_in=900  # 15 minutes
+        )
+
+        # Create pending submission record
+        pending = PendingSubmission.objects.create(
+            school=request.user.school,
+            student=student,
+            assignment=assignment,
+            file_path=file_path,
+            file_name=file_name,
+            content_type=content_type,
+            expires_at=datetime.now() + timedelta(seconds=900)
+        )
+
+        return Response({
+            "draft_id": str(pending.id),
+            "upload_url": upload_data['url'],
+            "file_path": file_path,
+            "expires_at": upload_data['expires_at'],
+            "expires_in": upload_data['expires_in'],
+            "assignment": {
+                "id": str(assignment.id),
+                "title": assignment.title,
+                "subject": assignment.subject.name,
+                "section": assignment.section.name,
+                "due_date": assignment.due_date
+            }
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='complete-upload')
+    def complete_upload(self, request):
+        """
+        POST /api/v1/operations/submissions/complete-upload/
+        
+        Step 2: Student confirms upload, creates submission entry with embedded view URL
+        
+        Request:
+        {
+            "draft_id": "uuid"
+        }
+        
+        Response:
+        {
+            "submission": {
+                "id": "uuid",
+                "assignment": "Science Project",
+                "subject": "Biology",
+                "section": "Daisy",
+                "submitted_at": "2026-06-22T09:00:00Z",
+                "file_path": "submissions/...",
+                "file_name": "syllabus.pdf",
+                "view_url": "https://r2.signed.view.url",
+                "view_expires_at": "2026-06-29T09:00:00Z",
+                "view_expires_in": 604800,
+                "status": "Submitted"
+            }
+        }
+        """
+        draft_id = request.data.get('draft_id')
+        
+        if not draft_id:
+            return Response(
+                {"detail": "draft_id is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            pending = PendingSubmission.objects.get(
+                id=draft_id,
+                student__user=request.user,
+                school=request.user.school,
+                is_completed=False
+            )
+        except PendingSubmission.DoesNotExist:
+            return Response(
+                {"detail": "Invalid or expired draft."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if draft has expired
+        if pending.expires_at < datetime.now():
+            pending.delete()
+            return Response(
+                {"detail": "Upload session has expired. Please start over."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Verify file was uploaded to R2
+        if not r2_storage.confirm_upload(pending.file_path):
+            return Response(
+                {"detail": "File upload could not be verified. Please try again."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Create the submission
+        submission = StudentSubmission.objects.create(
+            school=request.user.school,
+            assignment=pending.assignment,
+            student=pending.student,
+            file=pending.file_path,  # Store the organized path
+            status='Submitted'
+        )
+
+        # Mark pending as completed
+        pending.is_completed = True
+        pending.save(update_fields=['is_completed'])
+
+        # Generate view URL (valid for 7 days)
+        view_data = r2_storage.generate_view_url(
+            pending.file_path,
+            expires_in=604800  # 7 days
+        )
+
+        return Response({
+            "submission": {
+                "id": str(submission.id),
+                "assignment": pending.assignment.title,
+                "subject": pending.assignment.subject.name,
+                "section": pending.assignment.section.name,
+                "submitted_at": submission.submitted_at,
+                "file_path": pending.file_path,
+                "file_name": pending.file_name,
+                "view_url": view_data['url'],
+                "view_expires_at": view_data['expires_at'],
+                "view_expires_in": view_data['expires_in'],
+                "status": submission.status
+            }
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'], url_path='my-pending-drafts')
+    def my_pending_drafts(self, request):
+        """
+        GET /api/v1/operations/submissions/my-pending-drafts/
+        
+        Returns pending drafts for the current student
+        """
+        try:
+            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {"detail": "Student profile not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        pending = PendingSubmission.objects.filter(
+            student=student,
+            school=request.user.school,
+            is_completed=False
+        ).select_related('assignment', 'assignment__subject')
+
+        results = []
+        for p in pending:
+            is_expired = p.expires_at < datetime.now()
+            results.append({
+                "draft_id": str(p.id),
+                "assignment": {
+                    "id": str(p.assignment.id),
+                    "title": p.assignment.title,
+                    "subject": p.assignment.subject.name
+                },
+                "file_name": p.file_name,
+                "file_path": p.file_path,
+                "created_at": p.created_at,
+                "expires_at": p.expires_at,
+                "is_expired": is_expired
+            })
+
+        return Response({
+            "count": len(results),
+            "results": results
+        })
+
+    @action(detail=False, methods=['delete'], url_path='cancel-draft')
+    def cancel_draft(self, request):
+        """
+        DELETE /api/v1/operations/submissions/cancel-draft/
+        
+        Cancels a pending draft
+        Request:
+        {
+            "draft_id": "uuid"
+        }
+        """
+        draft_id = request.data.get('draft_id')
+        
+        if not draft_id:
+            return Response(
+                {"detail": "draft_id is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            pending = PendingSubmission.objects.get(
+                id=draft_id,
+                student__user=request.user,
+                school=request.user.school,
+                is_completed=False
+            )
+            pending.delete()
+            return Response(
+                {"detail": "Draft cancelled successfully."},
+                status=status.HTTP_200_OK
+            )
+        except PendingSubmission.DoesNotExist:
+            return Response(
+                {"detail": "Draft not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    # ============================================
+    # VIEW SUBMISSIONS WITH EMBEDDED VIEW URLS
+    # ============================================
 
     @action(detail=False, methods=['get'], url_path='me')
     def my_submissions(self, request):
-        user = request.user
-        student_id = None
+        """
+        GET /api/v1/operations/submissions/me/
         
+        Returns all submissions with embedded view URLs for the current student
+        """
         try:
-            student = StudentProfile.objects.get(user=user, school=user.school)
-            student_id = student.id
+            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
         except StudentProfile.DoesNotExist:
-            try:
-                parent = ParentProfile.objects.get(user=user, school=user.school)
-                requested_student_id = request.query_params.get('student')
-                if not requested_student_id:
-                    return Response(
-                        {"detail": "student parameter is required for parent accounts."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                from profiles.models import ParentStudentMapping
-                if not ParentStudentMapping.objects.filter(
-                    parent=parent, 
-                    student_id=requested_student_id,
-                    can_view_academics=True
-                ).exists():
-                    return Response(
-                        {"detail": "You are not authorized to view this student's data."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                student_id = requested_student_id
-            except ParentProfile.DoesNotExist:
-                return Response(
-                    {"detail": "Student or Parent profile not found."},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-
-        if not student_id:
             return Response(
-                {"detail": "Student ID not found."},
+                {"detail": "Student profile not found."},
                 status=status.HTTP_404_NOT_FOUND
             )
 
         submissions = StudentSubmission.objects.filter(
-            student_id=student_id,
+            student=student,
             school=request.user.school
         ).select_related('assignment', 'assignment__subject', 'assignment__section')\
          .order_by('-submitted_at')
 
-        serializer = self.get_serializer(submissions, many=True)
+        results = []
+        for submission in submissions:
+            # Generate view URL for each submission
+            view_url = None
+            view_expires_at = None
+            if submission.file:
+                try:
+                    view_data = r2_storage.generate_view_url(
+                        submission.file,
+                        expires_in=604800  # 7 days
+                    )
+                    view_url = view_data['url']
+                    view_expires_at = view_data['expires_at']
+                except Exception:
+                    pass
+
+            results.append({
+                "id": str(submission.id),
+                "assignment": {
+                    "id": str(submission.assignment.id),
+                    "title": submission.assignment.title,
+                    "subject": submission.assignment.subject.name,
+                    "section": submission.assignment.section.name,
+                    "due_date": submission.assignment.due_date
+                },
+                "file_path": submission.file,
+                "view_url": view_url,
+                "view_expires_at": view_expires_at,
+                "submitted_at": submission.submitted_at,
+                "grade": float(submission.grade) if submission.grade is not None else None,
+                "status": submission.status
+            })
+
         return Response({
-            "count": submissions.count(),
-            "results": serializer.data
+            "count": len(results),
+            "results": results
         })
 
-    # --- TEACHER SUBMISSION METHODS ---
+    # ============================================
+    # TEACHER VIEWS WITH EMBEDDED VIEW URLS
+    # ============================================
 
-    @action(detail=False, methods=['get'], url_path='me/pending')
-    def my_pending_submissions(self, request):
+    @action(detail=False, methods=['get'], url_path='teacher/pending')
+    def teacher_pending(self, request):
         """
-        GET /api/v1/operations/submissions/me/pending/
-        Returns submissions pending grading for the teacher
+        GET /api/v1/operations/submissions/teacher/pending/
+        
+        Teacher views all pending submissions across all their assignments
+        with embedded view URLs
         """
         try:
             teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
@@ -1358,16 +1881,27 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
             assignment__in=assignments,
             grade__isnull=True,
             status='Submitted'
-        ).select_related('assignment', 'student__user', 'assignment__subject', 'assignment__section')
+        ).select_related('assignment', 'student__user', 'assignment__subject', 'assignment__section')\
+         .order_by('-submitted_at')
 
-        assignment_id = request.query_params.get('assignment_id')
-        if assignment_id:
-            pending_submissions = pending_submissions.filter(assignment_id=assignment_id)
-
-        data = []
+        results = []
         for submission in pending_submissions:
-            data.append({
-                "id": str(submission.id),
+            # Generate view URL for each submission
+            view_url = None
+            view_expires_at = None
+            if submission.file:
+                try:
+                    view_data = r2_storage.generate_view_url(
+                        submission.file,
+                        expires_in=604800  # 7 days
+                    )
+                    view_url = view_data['url']
+                    view_expires_at = view_data['expires_at']
+                except Exception:
+                    pass
+
+            results.append({
+                "submission_id": str(submission.id),
                 "student": {
                     "id": str(submission.student.id),
                     "name": f"{submission.student.user.first_name} {submission.student.user.last_name}",
@@ -1380,20 +1914,23 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
                     "section": submission.assignment.section.name,
                     "due_date": submission.assignment.due_date
                 },
-                "submitted_at": submission.submitted_at,
-                "file": submission.file.url if submission.file else None
+                "file_path": submission.file,
+                "view_url": view_url,
+                "view_expires_at": view_expires_at,
+                "submitted_at": submission.submitted_at
             })
 
         return Response({
-            "count": len(data),
-            "results": data
+            "count": len(results),
+            "results": results
         })
 
-    @action(detail=False, methods=['get'], url_path='me/assignment/(?P<assignment_id>[^/.]+)')
-    def my_assignment_submissions(self, request, assignment_id):
+    @action(detail=False, methods=['get'], url_path='teacher/assignment/(?P<assignment_id>[^/.]+)')
+    def teacher_assignment_submissions(self, request, assignment_id):
         """
-        GET /api/v1/operations/submissions/me/assignment/{assignment_id}/
-        Returns all submissions for a specific assignment
+        GET /api/v1/operations/submissions/teacher/assignment/{assignment_id}/
+        
+        Teacher views all submissions for an assignment with embedded view URLs
         """
         try:
             teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
@@ -1403,6 +1940,7 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        # Verify teacher owns this assignment
         assignment = Assignment.objects.filter(
             id=assignment_id,
             teacher=teacher,
@@ -1420,25 +1958,37 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
             school=request.user.school
         ).select_related('student__user').order_by('-submitted_at')
 
-        data = []
+        results = []
         for submission in submissions:
-            data.append({
-                "id": str(submission.id),
+            # Generate view URL for each submission
+            view_url = None
+            view_expires_at = None
+            if submission.file:
+                try:
+                    view_data = r2_storage.generate_view_url(
+                        submission.file,
+                        expires_in=604800  # 7 days
+                    )
+                    view_url = view_data['url']
+                    view_expires_at = view_data['expires_at']
+                except Exception:
+                    pass
+
+            results.append({
+                "submission_id": str(submission.id),
                 "student": {
                     "id": str(submission.student.id),
                     "name": f"{submission.student.user.first_name} {submission.student.user.last_name}",
-                    "enrollment_number": submission.student.enrollment_number
+                    "enrollment_number": submission.student.enrollment_number,
+                    "email": submission.student.user.email
                 },
-                "file": submission.file.url if submission.file else None,
+                "file_path": submission.file,
+                "view_url": view_url,
+                "view_expires_at": view_expires_at,
                 "submitted_at": submission.submitted_at,
                 "grade": float(submission.grade) if submission.grade is not None else None,
-                "status": submission.status,
-                "remarks": getattr(submission, 'remarks', '')
+                "status": submission.status
             })
-
-        total = len(data)
-        graded = len([s for s in data if s['grade'] is not None])
-        pending = total - graded
 
         return Response({
             "assignment": {
@@ -1450,9 +2000,53 @@ class StudentSubmissionViewSet(TenantAwareModelViewSet):
                 "due_date": assignment.due_date
             },
             "summary": {
-                "total_submissions": total,
-                "graded": graded,
-                "pending": pending
+                "total_submissions": len(results),
+                "graded": len([s for s in results if s['grade'] is not None]),
+                "pending": len([s for s in results if s['grade'] is None])
             },
-            "submissions": data
+            "submissions": results
         })
+
+    # ============================================
+    # LEGACY METHODS - KEPT FOR BACKWARDS COMPATIBILITY
+    # ============================================
+
+    @action(detail=False, methods=['post'], url_path='submit-with-file')
+    def submit_with_file(self, request):
+        """
+        DEPRECATED: Use /initiate-upload/ instead.
+        This is kept for backward compatibility.
+        """
+        return self.initiate_upload(request)
+
+    @action(detail=False, methods=['post'], url_path='confirm-submission-file')
+    def confirm_submission_file(self, request):
+        """
+        DEPRECATED: Use /complete-upload/ instead.
+        This is kept for backward compatibility.
+        """
+        return self.complete_upload(request)
+
+    @action(detail=False, methods=['get'], url_path='me/pending')
+    def me_pending_submissions(self, request):
+        """
+        DEPRECATED: Use /my-pending-drafts/ instead.
+        This is kept for backward compatibility.
+        """
+        return self.my_pending_drafts(request)
+
+    @action(detail=False, methods=['get'], url_path='me/assignment/(?P<assignment_id>[^/.]+)')
+    def my_assignment_submissions(self, request, assignment_id):
+        """
+        DEPRECATED: Use /teacher/assignment/{assignment_id}/ instead.
+        This is kept for backward compatibility.
+        """
+        return self.teacher_assignment_submissions(request, assignment_id)
+
+    @action(detail=False, methods=['get'], url_path='me/pending_old')
+    def old_pending_submissions(self, request):
+        """
+        DEPRECATED: Use /teacher/pending/ instead.
+        This is kept for backward compatibility.
+        """
+        return self.teacher_pending(request)
