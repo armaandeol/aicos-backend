@@ -1,7 +1,6 @@
 from django.db import transaction
-# operations/views.py - Add these imports at the top
-from django.conf import settings
-from datetime import datetime, timedelta
+from django.utils import timezone
+from datetime import datetime
 from core.utils.r2_storage import r2_storage
 from rest_framework import viewsets, status, filters
 from rest_framework.permissions import IsAuthenticated
@@ -9,101 +8,63 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from drf_spectacular.utils import extend_schema
-from django.db.models import Count, Avg, Q
-from django.utils import timezone
 import uuid
 import os
 
 from tenants.views import TenantAwareModelViewSet
 from profiles.models import StudentProfile, ParentProfile, TeacherProfile
-from academics.models import StudentEnrollment, TeacherAssignment, Subject, Section
-from accounts.permissions import IsStudent, IsTeacher, IsParent, IsTeacherOrStaff, IsParentOfStudent
-from .models import Attendance, Exam, StudentGrade, Assignment, StudentSubmission, PendingSubmission
+from academics.models import StudentEnrollment, TeacherAssignment
+from accounts.permissions import IsStudent, IsTeacher, IsTeacherOrStaff
+from .models import Attendance, Exam, StudentGrade, Assignment, StudentSubmission
 from .serializers import (
     AttendanceSerializer, BulkAttendanceSerializer,
     ExamSerializer, StudentGradeSerializer, BulkGradeSubmitSerializer,
-    AssignmentSerializer, StudentSubmissionSerializer,
-    StudentSubmissionCreateSerializer, AssignmentWithStatusSerializer,
+    AssignmentSerializer, AssignmentWithStatusSerializer,
+    StudentSubmissionSerializer, SubmissionWithViewUrlSerializer,
 )
-from core.utils.r2_storage import r2_storage
 
 
-# --- HELPER FUNCTIONS ---
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
-def generate_submission_file_path(student_id, assignment_id, file_name):
+def _file_path_str(file_field):
+    """Safely convert a FileField / string / None to a plain string path."""
+    if not file_field:
+        return None
+    return str(file_field.name) if hasattr(file_field, 'name') else str(file_field)
+
+
+def _embed_view_url(file_field, expires_in=604800):
+    """Generate a 7-day inline view URL for a submission file. Returns None on failure."""
+    path = _file_path_str(file_field)
+    if not path:
+        return None
+    try:
+        return r2_storage.generate_view_url(path, expires_in=expires_in)['url']
+    except Exception:
+        return None
+
+
+def _attach_view_urls(submissions):
     """
-    Generate a clean, organized file path for a submission.
-    
-    Structure: submissions/{student_id}/{assignment_id}/{timestamp}_{uuid}.{ext}
-    
-    Args:
-        student_id (str): UUID of the student
-        assignment_id (str): UUID of the assignment
-        file_name (str): Original filename
-        
-    Returns:
-        str: Generated file path
+    Attach _view_url to each submission object in-place.
+    Call this before passing to SubmissionWithViewUrlSerializer.
     """
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    extension = os.path.splitext(file_name)[1] if file_name else '.pdf'
-    unique_id = str(uuid.uuid4())
-    
-    # Clean the file_name to remove any path traversal or special chars
-    base_name = os.path.splitext(file_name)[0] if file_name else 'submission'
-    # Keep only alphanumeric and underscore/dash
-    clean_base = ''.join(c for c in base_name if c.isalnum() or c in '._-')
-    clean_base = clean_base[:50]  # Limit length
-    
-    return f"submissions/{student_id}/{assignment_id}/{timestamp}_{unique_id}{extension}"
+    for s in submissions:
+        s._view_url = _embed_view_url(s.file)
+    return submissions
 
-
-def generate_profile_picture_path(user_id, file_name):
-    """
-    Generate a clean, organized file path for a profile picture.
-    
-    Structure: profiles/pictures/{user_id}/{timestamp}_{uuid}.{ext}
-    """
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    extension = os.path.splitext(file_name)[1] if file_name else '.jpg'
-    unique_id = str(uuid.uuid4())
-    
-    return f"profiles/pictures/{user_id}/{timestamp}_{unique_id}{extension}"
-
-
-def generate_assignment_attachment_path(teacher_id, section_id, subject_id, file_name):
-    """
-    Generate a clean, organized file path for an assignment attachment.
-    
-    Structure: assignments/{teacher_id}/{section_id}/{subject_id}/{timestamp}_{uuid}.{ext}
-    """
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    extension = os.path.splitext(file_name)[1] if file_name else '.pdf'
-    unique_id = str(uuid.uuid4())
-    
-    return f"assignments/{teacher_id}/{section_id}/{subject_id}/{timestamp}_{unique_id}{extension}"
-
-
-# --- SHARED OWNERSHIP HELPERS ---
 
 def get_caller_student_id(user):
-    """
-    If the logged-in user IS a student themselves, return their own
-    StudentProfile id. Otherwise return None.
-    """
     profile = StudentProfile.objects.filter(user=user).first()
     return profile.id if profile else None
 
 
 def parent_can_access_student(user, student_id, require_academics=True):
-    """
-    True only if `user` has a ParentProfile that is mapped to `student_id`
-    via ParentStudentMapping, and (if require_academics) that mapping has
-    can_view_academics=True.
-    """
     parent_profile = ParentProfile.objects.filter(user=user).first()
     if not parent_profile:
         return False
-
     from profiles.models import ParentStudentMapping
     qs = ParentStudentMapping.objects.filter(parent=parent_profile, student_id=student_id)
     if require_academics:
@@ -112,51 +73,35 @@ def parent_can_access_student(user, student_id, require_academics=True):
 
 
 def resolve_effective_student_id(request):
-    """
-    Figures out which student's data this request is allowed to see,
-    given who is actually logged in.
-    """
     user = request.user
-    requested_student_id = request.query_params.get('student')
-
-    own_student_id = get_caller_student_id(user)
-    if own_student_id:
-        return str(own_student_id)
-
-    parent_profile = ParentProfile.objects.filter(user=user).first()
-    if parent_profile:
-        if not requested_student_id:
-            raise ValidationError({"student": "This parameter is required for parent accounts."})
-        if not parent_can_access_student(user, requested_student_id):
-            raise PermissionDenied("You are not authorized to view this student's data.")
-        return requested_student_id
-
-    return requested_student_id
+    requested = request.query_params.get('student')
+    own = get_caller_student_id(user)
+    if own:
+        return str(own)
+    parent = ParentProfile.objects.filter(user=user).first()
+    if parent:
+        if not requested:
+            raise ValidationError({"student": "Required for parent accounts."})
+        if not parent_can_access_student(user, requested):
+            raise PermissionDenied("Not authorized to view this student's data.")
+        return requested
+    return requested
 
 
-# ============================================
-# ATTENDANCE VIEWSET
-# ============================================
+# ---------------------------------------------------------------------------
+# ATTENDANCE
+# ---------------------------------------------------------------------------
 
 class AttendanceViewSet(TenantAwareModelViewSet):
-    """
-    Attendance ViewSet with proper RBAC:
-    - Students: Can only view their own attendance via /me/ endpoints
-    - Teachers: Can view and manage attendance for their sections
-    - Parents: Can view their children's attendance via /me/ with student param
-    - Admins: Full access
-    """
-    queryset = Attendance.objects.select_related('student__user', 'academic_year', 'class_level', 'section').all()
+    queryset = Attendance.objects.select_related(
+        'student__user', 'academic_year', 'class_level', 'section'
+    ).all()
     serializer_class = AttendanceSerializer
 
     def get_permissions(self):
-        """Dynamic permission checks based on action"""
-        if self.action in ['my_attendance', 'my_attendance_summary', 'my_today_attendance', 'my_section_attendance']:
+        if self.action in ['my_attendance', 'my_attendance_summary']:
             return [IsAuthenticated()]
-        elif self.action in ['bulk_record', 'create', 'update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsTeacher()]
-        else:
-            return [IsAuthenticated(), IsTeacher()]
+        return [IsAuthenticated(), IsTeacher()]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -167,13 +112,10 @@ class AttendanceViewSet(TenantAwareModelViewSet):
                 return qs.filter(student=student)
             except StudentProfile.DoesNotExist:
                 pass
-        
-        date = self.request.query_params.get('date', None)
-        student_id = self.request.query_params.get('student', None)
-        section_id = self.request.query_params.get('section', None)
-        if date: qs = qs.filter(date=date)
-        if student_id: qs = qs.filter(student_id=student_id)
-        if section_id: qs = qs.filter(section_id=section_id)
+        for param, field in [('date', 'date'), ('student', 'student_id'), ('section', 'section_id')]:
+            v = self.request.query_params.get(param)
+            if v:
+                qs = qs.filter(**{field: v})
         return qs
 
     @extend_schema(request=BulkAttendanceSerializer, responses={200: dict})
@@ -183,360 +125,186 @@ class AttendanceViewSet(TenantAwareModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         school = request.user.school
-
-        attendance_objects = [
+        objects = [
             Attendance(
-                school=school, academic_year_id=data['academic_year_id'],
-                class_level_id=data['class_level_id'], section_id=data['section_id'],
-                date=data['date'], student_id=r['student_id'],
-                status=r['status'], remarks=r.get('remarks', '')
+                school=school,
+                academic_year_id=data['academic_year_id'],
+                class_level_id=data['class_level_id'],
+                section_id=data['section_id'],
+                date=data['date'],
+                student_id=r['student_id'],
+                status=r['status'],
+                remarks=r.get('remarks', '')
             ) for r in data['records']
         ]
-
         with transaction.atomic():
             Attendance.objects.bulk_create(
-                attendance_objects, update_conflicts=True,
-                unique_fields=['school', 'student', 'date'], update_fields=['status', 'remarks']
+                objects, update_conflicts=True,
+                unique_fields=['school', 'student', 'date'],
+                update_fields=['status', 'remarks']
             )
-        return Response({"detail": f"Processed attendance for {len(attendance_objects)} students."}, status=status.HTTP_200_OK)
-
-    # --- STUDENT/PARENT ATTENDANCE METHODS ---
+        return Response({"detail": f"Processed {len(objects)} records."})
 
     @action(detail=False, methods=['get'], url_path='me')
     def my_attendance(self, request):
-        """
-        GET /api/v1/operations/attendance/me/
-        
-        For Students: Returns their own attendance records
-        For Parents: Returns their child's attendance records (requires ?student=ID)
-        For Teachers: Returns attendance for their sections
-        """
         user = request.user
         student_id = None
-        
         try:
-            student = StudentProfile.objects.get(user=user, school=user.school)
-            student_id = student.id
+            student_id = StudentProfile.objects.get(user=user, school=user.school).id
         except StudentProfile.DoesNotExist:
             try:
                 parent = ParentProfile.objects.get(user=user, school=user.school)
-                requested_student_id = request.query_params.get('student')
-                if not requested_student_id:
-                    return Response(
-                        {"detail": "student parameter is required for parent accounts."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                sid = request.query_params.get('student')
+                if not sid:
+                    return Response({"detail": "student param required for parents."}, status=400)
                 from profiles.models import ParentStudentMapping
-                if not ParentStudentMapping.objects.filter(
-                    parent=parent, 
-                    student_id=requested_student_id,
-                    can_view_academics=True
-                ).exists():
-                    return Response(
-                        {"detail": "You are not authorized to view this student's data."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                student_id = requested_student_id
+                if not ParentStudentMapping.objects.filter(parent=parent, student_id=sid, can_view_academics=True).exists():
+                    return Response({"detail": "Not authorized."}, status=403)
+                student_id = sid
             except ParentProfile.DoesNotExist:
                 pass
 
+        qs = Attendance.objects.filter(school=request.user.school)
         if student_id:
-            queryset = Attendance.objects.filter(
-                student_id=student_id,
-                school=request.user.school
-            ).order_by('-date')
-        else:
-            section_id = request.query_params.get('section')
-            queryset = Attendance.objects.filter(school=request.user.school)
-            if section_id:
-                queryset = queryset.filter(section_id=section_id)
-
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
-        month = request.query_params.get('month')
-        year = request.query_params.get('year')
-
-        if start_date:
-            queryset = queryset.filter(date__gte=start_date)
-        if end_date:
-            queryset = queryset.filter(date__lte=end_date)
-        if month and year:
-            queryset = queryset.filter(date__month=month, date__year=year)
-        elif month:
-            queryset = queryset.filter(date__month=month)
-        elif year:
-            queryset = queryset.filter(date__year=year)
-
-        if not any([start_date, end_date, month, year, request.query_params.get('section')]):
-            queryset = queryset[:30]
-
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            "count": queryset.count(),
-            "results": serializer.data
-        })
+            qs = qs.filter(student_id=student_id)
+        for param, field in [
+            ('start_date', 'date__gte'), ('end_date', 'date__lte'),
+            ('month', 'date__month'), ('year', 'date__year'),
+        ]:
+            v = request.query_params.get(param)
+            if v:
+                qs = qs.filter(**{field: v})
+        qs = qs.order_by('-date')
+        serializer = self.get_serializer(qs, many=True)
+        return Response({"count": qs.count(), "results": serializer.data})
 
     @action(detail=False, methods=['get'], url_path='me/summary')
     def my_attendance_summary(self, request):
-        """
-        GET /api/v1/operations/attendance/me/summary/
-        
-        For Students: Returns their own attendance summary
-        For Parents: Returns their child's attendance summary (requires ?student=ID)
-        """
         user = request.user
         student_id = None
-        
         try:
-            student = StudentProfile.objects.get(user=user, school=user.school)
-            student_id = student.id
+            student_id = StudentProfile.objects.get(user=user, school=user.school).id
         except StudentProfile.DoesNotExist:
             try:
                 parent = ParentProfile.objects.get(user=user, school=user.school)
-                requested_student_id = request.query_params.get('student')
-                if not requested_student_id:
-                    return Response(
-                        {"detail": "student parameter is required for parent accounts."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                sid = request.query_params.get('student')
+                if not sid:
+                    return Response({"detail": "student param required for parents."}, status=400)
                 from profiles.models import ParentStudentMapping
-                if not ParentStudentMapping.objects.filter(
-                    parent=parent, 
-                    student_id=requested_student_id,
-                    can_view_academics=True
-                ).exists():
-                    return Response(
-                        {"detail": "You are not authorized to view this student's data."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                student_id = requested_student_id
+                if not ParentStudentMapping.objects.filter(parent=parent, student_id=sid, can_view_academics=True).exists():
+                    return Response({"detail": "Not authorized."}, status=403)
+                student_id = sid
             except ParentProfile.DoesNotExist:
                 pass
 
+        qs = Attendance.objects.filter(school=request.user.school)
         if student_id:
-            queryset = Attendance.objects.filter(
-                student_id=student_id,
-                school=request.user.school
-            )
-        else:
-            queryset = Attendance.objects.filter(school=request.user.school)
+            qs = qs.filter(student_id=student_id)
+        for param, field in [('academic_year_id', 'academic_year_id'), ('month', 'date__month'), ('year', 'date__year')]:
+            v = request.query_params.get(param)
+            if v:
+                qs = qs.filter(**{field: v})
 
-        academic_year_id = request.query_params.get('academic_year_id')
-        month = request.query_params.get('month')
-        year = request.query_params.get('year')
-
-        if academic_year_id:
-            queryset = queryset.filter(academic_year_id=academic_year_id)
-        if month:
-            queryset = queryset.filter(date__month=month)
-        if year:
-            queryset = queryset.filter(date__year=year)
-
-        total_records = queryset.count()
-        if total_records == 0:
-            return Response({
-                "total_days": 0,
-                "present": 0,
-                "absent": 0,
-                "late": 0,
-                "half_day": 0,
-                "attendance_percentage": 0,
-                "status": "No records found"
-            })
-
-        present = queryset.filter(status='Present').count()
-        absent = queryset.filter(status='Absent').count()
-        late = queryset.filter(status='Late').count()
-        half_day = queryset.filter(status='Half-Day').count()
-
-        present_days = present + late
-        attendance_percentage = round((present_days / total_records) * 100, 2)
-
-        if attendance_percentage >= 90:
-            status_msg = "Excellent"
-        elif attendance_percentage >= 75:
-            status_msg = "Good"
-        elif attendance_percentage >= 60:
-            status_msg = "Needs Improvement"
-        else:
-            status_msg = "Poor - Please contact school"
-
+        total = qs.count()
+        if total == 0:
+            return Response({"total_days": 0, "present": 0, "absent": 0, "late": 0,
+                             "half_day": 0, "attendance_percentage": 0, "status": "No records"})
+        present = qs.filter(status='Present').count()
+        absent = qs.filter(status='Absent').count()
+        late = qs.filter(status='Late').count()
+        half_day = qs.filter(status='Half-Day').count()
+        pct = round(((present + late) / total) * 100, 2)
         return Response({
-            "total_days": total_records,
-            "present": present,
-            "absent": absent,
-            "late": late,
-            "half_day": half_day,
-            "attendance_percentage": attendance_percentage,
-            "status": status_msg
+            "total_days": total, "present": present, "absent": absent,
+            "late": late, "half_day": half_day, "attendance_percentage": pct,
+            "status": "Excellent" if pct >= 90 else "Good" if pct >= 75 else "Needs Improvement"
         })
-
-    # --- TEACHER ATTENDANCE METHODS ---
 
     @action(detail=False, methods=['get'], url_path='me/today')
     def my_today_attendance(self, request):
-        """
-        GET /api/v1/operations/attendance/me/today/
-        Returns today's attendance for all sections the teacher teaches
-        """
         try:
             teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
         except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+            return Response({"detail": "Teacher profile not found."}, status=404)
         today = timezone.now().date()
-        
         assignments = TeacherAssignment.objects.filter(
-            teacher=teacher,
-            school=request.user.school
+            teacher=teacher, school=request.user.school
         ).select_related('section', 'class_level', 'subject', 'academic_year')
-
         sections_data = []
-        for assignment in assignments:
+        for a in assignments:
             enrollments = StudentEnrollment.objects.filter(
-                school=request.user.school,
-                section=assignment.section,
-                academic_year=assignment.academic_year
+                school=request.user.school, section=a.section, academic_year=a.academic_year
             ).select_related('student__user')
-
             student_ids = [e.student.id for e in enrollments]
-            attendance_records = Attendance.objects.filter(
-                school=request.user.school,
-                section=assignment.section,
-                date=today,
-                student_id__in=student_ids
-            ).select_related('student__user')
-
+            records = Attendance.objects.filter(
+                school=request.user.school, section=a.section, date=today, student_id__in=student_ids
+            )
             attendance_data = []
-            for enrollment in enrollments:
-                record = attendance_records.filter(student=enrollment.student).first()
+            for e in enrollments:
+                rec = records.filter(student=e.student).first()
                 attendance_data.append({
-                    "student_id": str(enrollment.student.id),
-                    "student_name": f"{enrollment.student.user.first_name} {enrollment.student.user.last_name}",
-                    "roll_number": enrollment.roll_number,
-                    "status": record.status if record else "Not Marked",
-                    "remarks": record.remarks if record else ""
+                    "student_id": str(e.student.id),
+                    "student_name": f"{e.student.user.first_name} {e.student.user.last_name}",
+                    "roll_number": e.roll_number,
+                    "status": rec.status if rec else "Not Marked",
+                    "remarks": rec.remarks if rec else ""
                 })
-
             sections_data.append({
-                "section_id": str(assignment.section.id),
-                "section_name": assignment.section.name,
-                "class_level": assignment.class_level.name,
-                "subject": assignment.subject.name,
+                "section_id": str(a.section.id), "section_name": a.section.name,
+                "class_level": a.class_level.name, "subject": a.subject.name,
                 "total_students": len(attendance_data),
-                "marked": attendance_records.count(),
-                "pending": len(attendance_data) - attendance_records.count(),
+                "marked": records.count(), "pending": len(attendance_data) - records.count(),
                 "attendance": attendance_data
             })
-
-        return Response({
-            "date": today.isoformat(),
-            "sections": sections_data
-        })
+        return Response({"date": today.isoformat(), "sections": sections_data})
 
     @action(detail=False, methods=['get'], url_path='me/section/(?P<section_id>[^/.]+)')
     def my_section_attendance(self, request, section_id):
-        """
-        GET /api/v1/operations/attendance/me/section/{section_id}/
-        Returns attendance for a specific section
-        """
         try:
             teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
         except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        assignment = TeacherAssignment.objects.filter(
-            teacher=teacher,
-            section_id=section_id,
-            school=request.user.school
-        ).first()
-
-        if not assignment:
-            return Response(
-                {"detail": "You are not assigned to this section."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
-        month = request.query_params.get('month')
-        year = request.query_params.get('year')
-
-        attendance_qs = Attendance.objects.filter(
-            school=request.user.school,
-            section_id=section_id
-        ).select_related('student__user')
-
-        if start_date:
-            attendance_qs = attendance_qs.filter(date__gte=start_date)
-        if end_date:
-            attendance_qs = attendance_qs.filter(date__lte=end_date)
-        if month and year:
-            attendance_qs = attendance_qs.filter(date__month=month, date__year=year)
-
+            return Response({"detail": "Teacher profile not found."}, status=404)
+        a = TeacherAssignment.objects.filter(teacher=teacher, section_id=section_id, school=request.user.school).first()
+        if not a:
+            return Response({"detail": "Not assigned to this section."}, status=403)
+        qs = Attendance.objects.filter(school=request.user.school, section_id=section_id).select_related('student__user')
+        for param, field in [('start_date', 'date__gte'), ('end_date', 'date__lte'), ('month', 'date__month'), ('year', 'date__year')]:
+            v = request.query_params.get(param)
+            if v:
+                qs = qs.filter(**{field: v})
         dates_data = {}
-        for record in attendance_qs:
-            date_str = record.date.isoformat()
-            if date_str not in dates_data:
-                dates_data[date_str] = {
-                    "date": date_str,
-                    "total": 0,
-                    "present": 0,
-                    "absent": 0,
-                    "late": 0,
-                    "half_day": 0,
-                    "records": []
-                }
-            dates_data[date_str]["total"] += 1
-            status_key = record.status.lower().replace('-', '_')
-            if status_key in dates_data[date_str]:
-                dates_data[date_str][status_key] += 1
-            dates_data[date_str]["records"].append({
-                "student_id": str(record.student.id),
-                "student_name": record.student.user.first_name,
-                "status": record.status,
-                "remarks": record.remarks
+        for rec in qs:
+            ds = rec.date.isoformat()
+            if ds not in dates_data:
+                dates_data[ds] = {"date": ds, "total": 0, "present": 0, "absent": 0, "late": 0, "half_day": 0, "records": []}
+            dates_data[ds]["total"] += 1
+            sk = rec.status.lower().replace('-', '_')
+            if sk in dates_data[ds]:
+                dates_data[ds][sk] += 1
+            dates_data[ds]["records"].append({
+                "student_id": str(rec.student.id),
+                "student_name": rec.student.user.first_name,
+                "status": rec.status, "remarks": rec.remarks
             })
-
         return Response({
-            "section": {
-                "id": str(assignment.section.id),
-                "name": assignment.section.name,
-                "class_level": assignment.class_level.name,
-                "subject": assignment.subject.name
-            },
+            "section": {"id": str(a.section.id), "name": a.section.name,
+                        "class_level": a.class_level.name, "subject": a.subject.name},
             "attendance": list(dates_data.values())
         })
 
 
-# ============================================
-# EXAM VIEWSET
-# ============================================
+# ---------------------------------------------------------------------------
+# EXAM
+# ---------------------------------------------------------------------------
 
 class ExamViewSet(TenantAwareModelViewSet):
-    """
-    Exam ViewSet with proper RBAC:
-    - Students: Can view their own exams via /me/ endpoints
-    - Parents: Can view their children's exams via /me/ with student param
-    - Teachers: Can view and manage exams
-    - Admins: Full access
-    """
     queryset = Exam.objects.select_related('academic_year').all()
     serializer_class = ExamSerializer
 
     def get_permissions(self):
         if self.action in ['my_exams', 'my_upcoming_exams']:
             return [IsAuthenticated()]
-        elif self.action in ['create', 'update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsTeacher()]
-        else:
-            return [IsAuthenticated(), IsTeacher()]
+        return [IsAuthenticated(), IsTeacher()]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -545,193 +313,82 @@ class ExamViewSet(TenantAwareModelViewSet):
             try:
                 student = StudentProfile.objects.get(user=user)
                 enrollment = StudentEnrollment.objects.filter(
-                    student=student,
-                    school=user.school
+                    student=student, school=user.school
                 ).order_by('-academic_year__start_date').first()
-                if enrollment:
-                    return qs.filter(academic_year=enrollment.academic_year)
-                return qs.none()
+                return qs.filter(academic_year=enrollment.academic_year) if enrollment else qs.none()
             except StudentProfile.DoesNotExist:
                 pass
         return qs
 
+    def _resolve_student(self, request):
+        user = request.user
+        try:
+            return StudentProfile.objects.get(user=user, school=user.school)
+        except StudentProfile.DoesNotExist:
+            pass
+        try:
+            parent = ParentProfile.objects.get(user=user, school=user.school)
+            sid = request.query_params.get('student')
+            if not sid:
+                return Response({"detail": "student param required for parents."}, status=400)
+            from profiles.models import ParentStudentMapping
+            if not ParentStudentMapping.objects.filter(parent=parent, student_id=sid, can_view_academics=True).exists():
+                return Response({"detail": "Not authorized."}, status=403)
+            return StudentProfile.objects.get(id=sid, school=request.user.school)
+        except (ParentProfile.DoesNotExist, StudentProfile.DoesNotExist):
+            return Response({"detail": "Student not found."}, status=404)
+
     @action(detail=False, methods=['get'], url_path='me')
     def my_exams(self, request):
-        """
-        GET /api/v1/operations/exams/me/
-        
-        For Students: Returns their own exams
-        For Parents: Returns their child's exams (requires ?student=ID)
-        """
-        user = request.user
-        student = None
-        
-        try:
-            student = StudentProfile.objects.get(user=user, school=user.school)
-        except StudentProfile.DoesNotExist:
-            try:
-                parent = ParentProfile.objects.get(user=user, school=user.school)
-                requested_student_id = request.query_params.get('student')
-                if not requested_student_id:
-                    return Response(
-                        {"detail": "student parameter is required for parent accounts."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                from profiles.models import ParentStudentMapping
-                if not ParentStudentMapping.objects.filter(
-                    parent=parent, 
-                    student_id=requested_student_id,
-                    can_view_academics=True
-                ).exists():
-                    return Response(
-                        {"detail": "You are not authorized to view this student's data."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                student = StudentProfile.objects.get(id=requested_student_id, school=request.user.school)
-            except (ParentProfile.DoesNotExist, StudentProfile.DoesNotExist):
-                return Response(
-                    {"detail": "Student profile not found."},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-
-        if not student:
-            return Response({
-                "count": 0,
-                "results": []
-            })
-
-        enrollment = StudentEnrollment.objects.filter(
-            student=student,
-            school=request.user.school
-        ).order_by('-academic_year__start_date').first()
-
+        student = self._resolve_student(request)
+        if isinstance(student, Response):
+            return student
+        enrollment = StudentEnrollment.objects.filter(student=student, school=request.user.school).order_by('-academic_year__start_date').first()
         if not enrollment:
-            return Response({
-                "count": 0,
-                "results": []
-            })
-
-        exams = Exam.objects.filter(
-            school=request.user.school,
-            academic_year=enrollment.academic_year
-        ).order_by('start_date')
-
-        serializer = self.get_serializer(exams, many=True)
-        return Response({
-            "count": exams.count(),
-            "results": serializer.data
-        })
+            return Response({"count": 0, "results": []})
+        exams = Exam.objects.filter(school=request.user.school, academic_year=enrollment.academic_year).order_by('start_date')
+        return Response({"count": exams.count(), "results": self.get_serializer(exams, many=True).data})
 
     @action(detail=False, methods=['get'], url_path='me/upcoming')
     def my_upcoming_exams(self, request):
-        """
-        GET /api/v1/operations/exams/me/upcoming/
-        
-        For Students: Returns their upcoming exams
-        For Parents: Returns their child's upcoming exams (requires ?student=ID)
-        """
-        user = request.user
-        student = None
-        
-        try:
-            student = StudentProfile.objects.get(user=user, school=user.school)
-        except StudentProfile.DoesNotExist:
-            try:
-                parent = ParentProfile.objects.get(user=user, school=user.school)
-                requested_student_id = request.query_params.get('student')
-                if not requested_student_id:
-                    return Response(
-                        {"detail": "student parameter is required for parent accounts."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                from profiles.models import ParentStudentMapping
-                if not ParentStudentMapping.objects.filter(
-                    parent=parent, 
-                    student_id=requested_student_id,
-                    can_view_academics=True
-                ).exists():
-                    return Response(
-                        {"detail": "You are not authorized to view this student's data."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                student = StudentProfile.objects.get(id=requested_student_id, school=request.user.school)
-            except (ParentProfile.DoesNotExist, StudentProfile.DoesNotExist):
-                return Response(
-                    {"detail": "Student profile not found."},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-
-        if not student:
-            return Response({
-                "count": 0,
-                "results": []
-            })
-
-        enrollment = StudentEnrollment.objects.filter(
-            student=student,
-            school=request.user.school
-        ).order_by('-academic_year__start_date').first()
-
+        student = self._resolve_student(request)
+        if isinstance(student, Response):
+            return student
+        enrollment = StudentEnrollment.objects.filter(student=student, school=request.user.school).order_by('-academic_year__start_date').first()
         if not enrollment:
-            return Response({
-                "count": 0,
-                "results": []
-            })
-
+            return Response({"count": 0, "results": []})
         today = timezone.now().date()
         exams = Exam.objects.filter(
-            school=request.user.school,
-            academic_year=enrollment.academic_year,
-            start_date__gte=today
+            school=request.user.school, academic_year=enrollment.academic_year, start_date__gte=today
         ).order_by('start_date')
-
-        serializer = self.get_serializer(exams, many=True)
-        return Response({
-            "count": exams.count(),
-            "results": serializer.data
-        })
+        return Response({"count": exams.count(), "results": self.get_serializer(exams, many=True).data})
 
 
-# ============================================
-# STUDENT GRADE VIEWSET
-# ============================================
+# ---------------------------------------------------------------------------
+# GRADES
+# ---------------------------------------------------------------------------
 
 class StudentGradeViewSet(TenantAwareModelViewSet):
-    """
-    StudentGrade ViewSet with proper RBAC:
-    - Students: Can view their own grades via /me/ endpoints
-    - Parents: Can view their children's grades via /me/ with student param
-    - Teachers: Can view and manage grades for their sections
-    - Admins: Full access
-    """
     queryset = StudentGrade.objects.select_related('student__user', 'exam', 'subject').all()
     serializer_class = StudentGradeSerializer
 
     def get_permissions(self):
         if self.action in ['my_grades', 'my_report_card', 'my_section_gradebook']:
             return [IsAuthenticated()]
-        elif self.action in ['bulk_submit', 'create', 'update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsTeacher()]
-        else:
-            return [IsAuthenticated(), IsTeacher()]
+        return [IsAuthenticated(), IsTeacher()]
 
     def get_queryset(self):
         qs = super().get_queryset()
         user = self.request.user
         if not (user.is_superuser or user.is_staff):
             try:
-                student = StudentProfile.objects.get(user=user)
-                return qs.filter(student=student)
+                return qs.filter(student=StudentProfile.objects.get(user=user))
             except StudentProfile.DoesNotExist:
                 pass
-        
-        exam_id = self.request.query_params.get('exam', None)
-        student_id = self.request.query_params.get('student', None)
-        subject_id = self.request.query_params.get('subject', None)
-
-        if exam_id: qs = qs.filter(exam_id=exam_id)
-        if student_id: qs = qs.filter(student_id=student_id)
-        if subject_id: qs = qs.filter(subject_id=subject_id)
+        for param, field in [('exam', 'exam_id'), ('student', 'student_id'), ('subject', 'subject_id')]:
+            v = self.request.query_params.get(param)
+            if v:
+                qs = qs.filter(**{field: v})
         return qs
 
     @extend_schema(request=BulkGradeSubmitSerializer, responses={200: dict})
@@ -739,1887 +396,631 @@ class StudentGradeViewSet(TenantAwareModelViewSet):
     def bulk_submit(self, request):
         serializer = BulkGradeSubmitSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
-
         data = serializer.validated_data
         school = request.user.school
-
-        grade_objects = []
-        for record in data['records']:
-            grade_objects.append(
-                StudentGrade(
-                    school=school,
-                    exam_id=data['exam_id'],
-                    subject_id=data['subject_id'],
-                    student_id=record['student_id'],
-                    marks_obtained=record['marks_obtained'],
-                    max_marks=record.get('max_marks', 100.00),
-                    remarks=record.get('remarks', '')
-                )
-            )
-
+        objects = [
+            StudentGrade(
+                school=school, exam_id=data['exam_id'], subject_id=data['subject_id'],
+                student_id=r['student_id'], marks_obtained=r['marks_obtained'],
+                max_marks=r.get('max_marks', 100.00), remarks=r.get('remarks', '')
+            ) for r in data['records']
+        ]
         with transaction.atomic():
             StudentGrade.objects.bulk_create(
-                grade_objects,
-                update_conflicts=True,
+                objects, update_conflicts=True,
                 unique_fields=['school', 'exam', 'student', 'subject'],
                 update_fields=['marks_obtained', 'max_marks', 'remarks']
             )
+        return Response({"detail": f"Processed grades for {len(objects)} students."})
 
-        return Response(
-            {"detail": f"Successfully processed grades for {len(grade_objects)} students."},
-            status=status.HTTP_200_OK
-        )
+    def _resolve_student_id(self, request):
+        user = request.user
+        try:
+            return StudentProfile.objects.get(user=user, school=user.school).id
+        except StudentProfile.DoesNotExist:
+            pass
+        try:
+            parent = ParentProfile.objects.get(user=user, school=user.school)
+            sid = request.query_params.get('student')
+            if not sid:
+                return Response({"detail": "student param required for parents."}, status=400)
+            from profiles.models import ParentStudentMapping
+            if not ParentStudentMapping.objects.filter(parent=parent, student_id=sid, can_view_academics=True).exists():
+                return Response({"detail": "Not authorized."}, status=403)
+            return sid
+        except ParentProfile.DoesNotExist:
+            return Response({"detail": "Profile not found."}, status=404)
 
     @action(detail=False, methods=['get'], url_path='me')
     def my_grades(self, request):
-        """
-        GET /api/v1/operations/grades/me/
-        
-        For Students: Returns their own grades
-        For Parents: Returns their child's grades (requires ?student=ID)
-        """
-        user = request.user
-        student_id = None
-        
-        try:
-            student = StudentProfile.objects.get(user=user, school=user.school)
-            student_id = student.id
-        except StudentProfile.DoesNotExist:
-            try:
-                parent = ParentProfile.objects.get(user=user, school=user.school)
-                requested_student_id = request.query_params.get('student')
-                if not requested_student_id:
-                    return Response(
-                        {"detail": "student parameter is required for parent accounts."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                from profiles.models import ParentStudentMapping
-                if not ParentStudentMapping.objects.filter(
-                    parent=parent, 
-                    student_id=requested_student_id,
-                    can_view_academics=True
-                ).exists():
-                    return Response(
-                        {"detail": "You are not authorized to view this student's data."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                student_id = requested_student_id
-            except ParentProfile.DoesNotExist:
-                return Response(
-                    {"detail": "Student or Parent profile not found."},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-
-        if not student_id:
-            return Response(
-                {"detail": "Student ID not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        queryset = StudentGrade.objects.filter(
-            student_id=student_id,
-            school=request.user.school
+        student_id = self._resolve_student_id(request)
+        if isinstance(student_id, Response):
+            return student_id
+        qs = StudentGrade.objects.filter(
+            student_id=student_id, school=request.user.school
         ).select_related('exam', 'subject', 'exam__academic_year')
-
-        exam_id = request.query_params.get('exam_id')
-        academic_year_id = request.query_params.get('academic_year_id')
-
-        if exam_id:
-            queryset = queryset.filter(exam_id=exam_id)
-        if academic_year_id:
-            queryset = queryset.filter(exam__academic_year_id=academic_year_id)
-
-        queryset = queryset.order_by('-exam__start_date', 'subject__name')
-
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            "count": queryset.count(),
-            "results": serializer.data
-        })
+        if request.query_params.get('exam_id'):
+            qs = qs.filter(exam_id=request.query_params['exam_id'])
+        if request.query_params.get('academic_year_id'):
+            qs = qs.filter(exam__academic_year_id=request.query_params['academic_year_id'])
+        qs = qs.order_by('-exam__start_date', 'subject__name')
+        return Response({"count": qs.count(), "results": self.get_serializer(qs, many=True).data})
 
     @action(detail=False, methods=['get'], url_path='me/report-card')
     def my_report_card(self, request):
-        """
-        GET /api/v1/operations/grades/me/report-card/
-        
-        For Students: Returns their own report card
-        For Parents: Returns their child's report card (requires ?student=ID)
-        """
-        user = request.user
-        student = None
-        
+        student_id = self._resolve_student_id(request)
+        if isinstance(student_id, Response):
+            return student_id
         try:
-            student = StudentProfile.objects.get(user=user, school=user.school)
+            student = StudentProfile.objects.get(id=student_id, school=request.user.school)
         except StudentProfile.DoesNotExist:
-            try:
-                parent = ParentProfile.objects.get(user=user, school=user.school)
-                requested_student_id = request.query_params.get('student')
-                if not requested_student_id:
-                    return Response(
-                        {"detail": "student parameter is required for parent accounts."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                from profiles.models import ParentStudentMapping
-                if not ParentStudentMapping.objects.filter(
-                    parent=parent, 
-                    student_id=requested_student_id,
-                    can_view_academics=True
-                ).exists():
-                    return Response(
-                        {"detail": "You are not authorized to view this student's data."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                student = StudentProfile.objects.get(id=requested_student_id, school=request.user.school)
-            except (ParentProfile.DoesNotExist, StudentProfile.DoesNotExist):
-                return Response(
-                    {"detail": "Student or Parent profile not found."},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-
-        if not student:
-            return Response(
-                {"detail": "Student not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        queryset = StudentGrade.objects.filter(
-            student=student,
-            school=request.user.school
+            return Response({"detail": "Student not found."}, status=404)
+        qs = StudentGrade.objects.filter(
+            student=student, school=request.user.school
         ).select_related('exam', 'subject', 'exam__academic_year')
-
-        academic_year_id = request.query_params.get('academic_year_id')
-        if academic_year_id:
-            queryset = queryset.filter(exam__academic_year_id=academic_year_id)
-
+        if request.query_params.get('academic_year_id'):
+            qs = qs.filter(exam__academic_year_id=request.query_params['academic_year_id'])
         exams_data = {}
-        for grade in queryset:
-            exam_name = grade.exam.name
-            if exam_name not in exams_data:
-                exams_data[exam_name] = {
-                    "exam_id": str(grade.exam.id),
-                    "exam_name": exam_name,
-                    "exam_date": grade.exam.start_date,
-                    "is_published": grade.exam.is_published,
-                    "subjects": []
-                }
-            
-            exams_data[exam_name]["subjects"].append({
-                "subject_id": str(grade.subject.id),
-                "subject_name": grade.subject.name,
-                "marks_obtained": float(grade.marks_obtained),
-                "max_marks": float(grade.max_marks),
-                "percentage": round((grade.marks_obtained / grade.max_marks) * 100, 2) if grade.max_marks > 0 else 0,
-                "remarks": grade.remarks
+        for g in qs:
+            en = g.exam.name
+            if en not in exams_data:
+                exams_data[en] = {"exam_id": str(g.exam.id), "exam_name": en,
+                                  "exam_date": g.exam.start_date, "is_published": g.exam.is_published, "subjects": []}
+            exams_data[en]["subjects"].append({
+                "subject_id": str(g.subject.id), "subject_name": g.subject.name,
+                "marks_obtained": float(g.marks_obtained), "max_marks": float(g.max_marks),
+                "percentage": round(float(g.marks_obtained / g.max_marks * 100), 2) if g.max_marks > 0 else 0,
+                "remarks": g.remarks
             })
-
-        all_grades = queryset.all()
+        all_grades = list(qs)
         total_marks = sum(g.marks_obtained for g in all_grades)
         total_max = sum(g.max_marks for g in all_grades)
-        overall_percentage = round((total_marks / total_max) * 100, 2) if total_max > 0 else 0
-
+        overall = round(float(total_marks / total_max * 100), 2) if total_max > 0 else 0
         return Response({
             "student_name": f"{student.user.first_name} {student.user.last_name}",
             "enrollment_number": student.enrollment_number,
-            "overall_percentage": overall_percentage,
-            "total_subjects": all_grades.count(),
+            "overall_percentage": overall,
+            "total_subjects": len(all_grades),
             "exams": list(exams_data.values())
         })
 
-    # --- TEACHER GRADEBOOK METHODS ---
-
     @action(detail=False, methods=['get'], url_path='me/section/(?P<section_id>[^/.]+)/exam/(?P<exam_id>[^/.]+)')
     def my_section_gradebook(self, request, section_id, exam_id):
-        """
-        GET /api/v1/operations/grades/me/section/{section_id}/exam/{exam_id}/
-        Returns gradebook for a specific section and exam
-        """
         try:
             teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
         except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        assignment = TeacherAssignment.objects.filter(
-            teacher=teacher,
-            section_id=section_id,
-            school=request.user.school        ).first()
-
+            return Response({"detail": "Teacher profile not found."}, status=404)
+        assignment = TeacherAssignment.objects.filter(teacher=teacher, section_id=section_id, school=request.user.school).first()
         if not assignment:
-            return Response(
-                {"detail": "You are not assigned to this section."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
+            return Response({"detail": "Not assigned to this section."}, status=403)
         try:
             exam = Exam.objects.get(id=exam_id, school=request.user.school)
         except Exam.DoesNotExist:
-            return Response(
-                {"detail": "Exam not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+            return Response({"detail": "Exam not found."}, status=404)
         enrollments = StudentEnrollment.objects.filter(
-            school=request.user.school,
-            section_id=section_id,
-            academic_year=exam.academic_year
+            school=request.user.school, section_id=section_id, academic_year=exam.academic_year
         ).select_related('student__user')
-
         student_ids = [e.student.id for e in enrollments]
         grades = StudentGrade.objects.filter(
-            school=request.user.school,
-            exam_id=exam_id,
-            student_id__in=student_ids,
-            subject=assignment.subject
-        ).select_related('student__user')
-
+            school=request.user.school, exam_id=exam_id, student_id__in=student_ids, subject=assignment.subject
+        )
+        grade_map = {g.student_id: g for g in grades}
         gradebook = []
-        for enrollment in enrollments:
-            student = enrollment.student
-            grade = grades.filter(student=student).first()
+        for e in enrollments:
+            g = grade_map.get(e.student.id)
             gradebook.append({
-                "student_id": str(student.id),
-                "student_name": f"{student.user.first_name} {student.user.last_name}",
-                "roll_number": enrollment.roll_number,
-                "marks_obtained": float(grade.marks_obtained) if grade else None,
-                "max_marks": float(grade.max_marks) if grade else 100.00,
-                "percentage": float(grade.marks_obtained / grade.max_marks * 100) if grade and grade.max_marks > 0 else None,
-                "remarks": grade.remarks if grade else None,
-                "graded": bool(grade)
+                "student_id": str(e.student.id),
+                "student_name": f"{e.student.user.first_name} {e.student.user.last_name}",
+                "roll_number": e.roll_number,
+                "marks_obtained": float(g.marks_obtained) if g else None,
+                "max_marks": float(g.max_marks) if g else 100.0,
+                "percentage": round(float(g.marks_obtained / g.max_marks * 100), 2) if g and g.max_marks > 0 else None,
+                "remarks": g.remarks if g else None,
+                "graded": bool(g)
             })
-
-        graded = [g for g in gradebook if g['graded']]
-        total_marks = sum(g['marks_obtained'] for g in graded if g['marks_obtained'])
-        total_max = sum(g['max_marks'] for g in graded if g['max_marks'])
-        avg_percentage = round((total_marks / total_max) * 100, 2) if total_max > 0 else 0
-
+        graded = [x for x in gradebook if x['graded']]
+        tm = sum(x['marks_obtained'] for x in graded if x['marks_obtained'])
+        tmx = sum(x['max_marks'] for x in graded if x['max_marks'])
+        avg = round(tm / tmx * 100, 2) if tmx > 0 else 0
         return Response({
-            "exam": {
-                "id": str(exam.id),
-                "name": exam.name,
-                "date": exam.start_date
-            },
-            "subject": {
-                "id": str(assignment.subject.id),
-                "name": assignment.subject.name
-            },
-            "section": {
-                "id": str(assignment.section.id),
-                "name": assignment.section.name,
-                "class_level": assignment.class_level.name
-            },
-            "summary": {
-                "total_students": len(gradebook),
-                "graded_students": len(graded),
-                "average_percentage": avg_percentage,
-                "highest": max((g['percentage'] for g in graded if g['percentage']), default=0),
-                "lowest": min((g['percentage'] for g in graded if g['percentage']), default=0)
-            },
+            "exam": {"id": str(exam.id), "name": exam.name, "date": exam.start_date},
+            "subject": {"id": str(assignment.subject.id), "name": assignment.subject.name},
+            "section": {"id": str(assignment.section.id), "name": assignment.section.name, "class_level": assignment.class_level.name},
+            "summary": {"total_students": len(gradebook), "graded_students": len(graded), "average_percentage": avg,
+                        "highest": max((x['percentage'] for x in graded if x['percentage']), default=0),
+                        "lowest": min((x['percentage'] for x in graded if x['percentage']), default=0)},
             "gradebook": gradebook
         })
 
 
-# ============================================
-# ASSIGNMENT VIEWSET
-# ============================================
+# ---------------------------------------------------------------------------
+# ASSIGNMENT
+# ---------------------------------------------------------------------------
 
 class AssignmentViewSet(TenantAwareModelViewSet):
-    """
-    Assignment ViewSet with proper RBAC:
-    - Students: Can view their own assignments via /me/ endpoints
-    - Parents: Can view their children's assignments via /for-student/ with student param
-    - Teachers: Can create, update, delete assignments
-    - Admins: Full access
-    """
     queryset = Assignment.objects.select_related('subject', 'section', 'teacher').all()
     serializer_class = AssignmentSerializer
 
     def get_permissions(self):
-        if self.action in ['my_assignments', 'my_upcoming_assignments']:
-            return [IsAuthenticated(), IsStudent()]
-        elif self.action == 'for_student':
+        if self.action in ['for_student', 'my_assignments', 'my_upcoming_assignments']:
             return [IsAuthenticated()]
-        elif self.action in ['create', 'update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsTeacher()]
-        else:
-            return [IsAuthenticated(), IsTeacher()]
+        return [IsAuthenticated(), IsTeacher()]
 
     def get_queryset(self):
         qs = super().get_queryset()
-
         own_student_id = get_caller_student_id(self.request.user)
         if own_student_id:
-            enrollment = StudentEnrollment.objects.filter(student_id=own_student_id).order_by(
-                '-academic_year__start_date'
-            ).first()
-            if enrollment:
-                return qs.filter(section_id=enrollment.section_id)
-            return qs.none()
-
-        section_id = self.request.query_params.get('section', None)
-        subject_id = self.request.query_params.get('subject', None)
-        teacher_id = self.request.query_params.get('teacher', None)
-
-        if section_id:
-            qs = qs.filter(section_id=section_id)
-        if subject_id:
-            qs = qs.filter(subject_id=subject_id)
-        if teacher_id:
-            qs = qs.filter(teacher_id=teacher_id)
-
+            enrollment = StudentEnrollment.objects.filter(
+                student_id=own_student_id
+            ).order_by('-academic_year__start_date').first()
+            return qs.filter(section_id=enrollment.section_id) if enrollment else qs.none()
+        for param, field in [('section', 'section_id'), ('subject', 'subject_id'), ('teacher', 'teacher_id')]:
+            v = self.request.query_params.get(param)
+            if v:
+                qs = qs.filter(**{field: v})
         return qs
 
     def perform_create(self, serializer):
         user = self.request.user
-        teacher_profile = TeacherProfile.objects.filter(user=user).first()
-        if not (user.is_superuser or user.is_staff or teacher_profile):
-            raise PermissionDenied("Only teachers or staff can create assignments.")
+        if not (user.is_superuser or user.is_staff or TeacherProfile.objects.filter(user=user).exists()):
+            raise PermissionDenied("Only teachers can create assignments.")
         super().perform_create(serializer)
 
-    @extend_schema(responses={200: AssignmentWithStatusSerializer(many=True)})
     @action(detail=False, methods=['get'], url_path='for-student')
     def for_student(self, request):
-        effective_student_id = resolve_effective_student_id(request)
-        if not effective_student_id:
-            raise ValidationError({"student": "This parameter is required."})
-
-        enrollment = StudentEnrollment.objects.filter(student_id=effective_student_id).order_by(
-            '-academic_year__start_date'
-        ).first()
+        sid = resolve_effective_student_id(request)
+        if not sid:
+            raise ValidationError({"student": "Required."})
+        enrollment = StudentEnrollment.objects.filter(student_id=sid).order_by('-academic_year__start_date').first()
         if not enrollment:
-            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
-
+            return Response({"count": 0, "results": []})
         assignments = Assignment.objects.filter(
             school=request.user.school, section_id=enrollment.section_id
         ).select_related('subject', 'section', 'teacher').order_by('-due_date')
-
-        serializer = AssignmentWithStatusSerializer(
-            assignments, many=True, context={'student_id': effective_student_id}
-        )
-        return Response({"count": assignments.count(), "results": serializer.data}, status=status.HTTP_200_OK)
-
-    # --- TEACHER ASSIGNMENT WITH FILE UPLOAD ---
-
-    @action(detail=False, methods=['post'], url_path='create-with-file')
-    def create_with_file(self, request):
-        """
-        POST /api/v1/operations/assignments/create-with-file/
-        
-        Step 1: Teacher creates assignment and gets upload URL for file
-        """
-        try:
-            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
-        except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        # Validate basic assignment data
-        title = request.data.get('title')
-        description = request.data.get('description')
-        subject_id = request.data.get('subject_id')
-        section_id = request.data.get('section_id')
-        due_date = request.data.get('due_date')
-        file_name = request.data.get('file_name')
-        content_type = request.data.get('content_type', 'application/pdf')
-
-        if not all([title, subject_id, section_id, due_date]):
-            return Response(
-                {"detail": "title, subject_id, section_id, and due_date are required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Validate subject and section
-        try:
-            subject = Subject.objects.get(id=subject_id, school=request.user.school)
-            section = Section.objects.get(id=section_id, school=request.user.school)
-        except (Subject.DoesNotExist, Section.DoesNotExist):
-            return Response(
-                {"detail": "Invalid subject or section."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        # Generate file path for assignment using helper
-        upload_data = None
-        file_path = None
-        
-        if file_name:
-            file_path = generate_assignment_attachment_path(teacher.id, section_id, subject_id, file_name)
-            
-            # Generate signed upload URL
-            upload_data = r2_storage.generate_upload_url(
-                file_path=file_path,
-                content_type=content_type,
-                expires_in=900  # 15 minutes
-            )
-
-        # Store pending assignment in session
-        request.session['pending_assignment'] = {
-            'title': title,
-            'description': description,
-            'subject_id': str(subject_id),
-            'section_id': str(section_id),
-            'due_date': due_date,
-            'teacher_id': str(teacher.id),
-            'file_path': file_path,
-            'file_name': file_name,
-        }
-
-        return Response({
-            "assignment_draft": {
-                "title": title,
-                "subject": subject.name,
-                "section": section.name,
-                "due_date": due_date
-            },
-            "upload": upload_data if upload_data else {
-                "message": "No file to upload"
-            },
-            "next_step": "upload_file" if upload_data else "create_assignment"
-        }, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=['post'], url_path='confirm-assignment-file')
-    def confirm_assignment_file(self, request):
-        """
-        POST /api/v1/operations/assignments/confirm-assignment-file/
-        
-        Step 2: After file upload, confirm and create the assignment
-        """
-        pending_assignment = request.session.get('pending_assignment')
-        
-        if not pending_assignment:
-            return Response(
-                {"detail": "No pending assignment found. Please start over."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Verify file was uploaded (if file was expected)
-        file_path = pending_assignment.get('file_path')
-        if file_path:
-            if not r2_storage.confirm_upload(file_path):
-                return Response(
-                    {"detail": "File upload could not be verified. Please try again."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-        # Create the actual assignment
-        try:
-            teacher = TeacherProfile.objects.get(id=pending_assignment['teacher_id'])
-            subject = Subject.objects.get(id=pending_assignment['subject_id'])
-            section = Section.objects.get(id=pending_assignment['section_id'])
-        except (TeacherProfile.DoesNotExist, Subject.DoesNotExist, Section.DoesNotExist):
-            return Response(
-                {"detail": "Invalid teacher, subject, or section."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        # Create assignment
-        assignment = Assignment.objects.create(
-            school=request.user.school,
-            title=pending_assignment['title'],
-            description=pending_assignment['description'],
-            subject=subject,
-            section=section,
-            teacher=teacher,
-            due_date=pending_assignment['due_date'],
-        )
-
-        # Clear session
-        del request.session['pending_assignment']
-
-        # Generate view URL for the file (if any)
-        view_url = None
-        if file_path:
-            view_data = r2_storage.generate_view_url(file_path, expires_in=604800)  # 7 days
-            view_url = view_data['url']
-
-        return Response({
-            "detail": "Assignment created successfully",
-            "assignment": {
-                "id": str(assignment.id),
-                "title": assignment.title,
-                "subject": subject.name,
-                "section": section.name,
-                "due_date": assignment.due_date,
-                "file_path": file_path,
-                "view_url": view_url
-            }
-        }, status=status.HTTP_201_CREATED)
-
-    # --- STUDENT ASSIGNMENT METHODS ---
+        serializer = AssignmentWithStatusSerializer(assignments, many=True, context={'student_id': sid})
+        return Response({"count": assignments.count(), "results": serializer.data})
 
     @action(detail=False, methods=['get'], url_path='me')
     def my_assignments(self, request):
+        """Student: list own assignments with submission status."""
         try:
             student = StudentProfile.objects.get(user=request.user, school=request.user.school)
         except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Student profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+            return Response({"detail": "Student profile not found."}, status=404)
         enrollment = StudentEnrollment.objects.filter(
-            student=student,
-            school=request.user.school
+            student=student, school=request.user.school
         ).order_by('-academic_year__start_date').first()
-
         if not enrollment:
-            return Response({
-                "count": 0,
-                "results": []
-            })
-
+            return Response({"count": 0, "results": []})
         assignments = Assignment.objects.filter(
-            school=request.user.school,
-            section_id=enrollment.section_id
+            school=request.user.school, section_id=enrollment.section_id
         ).select_related('subject', 'section', 'teacher').order_by('-due_date')
-
-        serializer = AssignmentWithStatusSerializer(
-            assignments, 
-            many=True, 
-            context={'student_id': str(student.id)}
-        )
-        
-        return Response({
-            "count": assignments.count(),
-            "results": serializer.data
-        })
+        serializer = AssignmentWithStatusSerializer(assignments, many=True, context={'student_id': str(student.id)})
+        return Response({"count": assignments.count(), "results": serializer.data})
 
     @action(detail=False, methods=['get'], url_path='me/upcoming')
     def my_upcoming_assignments(self, request):
+        """Student: upcoming assignments only."""
         try:
             student = StudentProfile.objects.get(user=request.user, school=request.user.school)
         except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Student profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+            return Response({"detail": "Student profile not found."}, status=404)
         enrollment = StudentEnrollment.objects.filter(
-            student=student,
-            school=request.user.school
+            student=student, school=request.user.school
         ).order_by('-academic_year__start_date').first()
-
         if not enrollment:
-            return Response({
-                "count": 0,
-                "results": []
-            })
-
+            return Response({"count": 0, "results": []})
         now = timezone.now()
         assignments = Assignment.objects.filter(
-            school=request.user.school,
-            section_id=enrollment.section_id,
-            due_date__gte=now
+            school=request.user.school, section_id=enrollment.section_id, due_date__gte=now
         ).select_related('subject', 'section', 'teacher').order_by('due_date')
-
-        serializer = AssignmentWithStatusSerializer(
-            assignments, 
-            many=True, 
-            context={'student_id': str(student.id)}
-        )
-        
-        return Response({
-            "count": assignments.count(),
-            "results": serializer.data
-        })
-
-    # --- TEACHER ASSIGNMENT METHODS ---
+        serializer = AssignmentWithStatusSerializer(assignments, many=True, context={'student_id': str(student.id)})
+        return Response({"count": assignments.count(), "results": serializer.data})
 
     @action(detail=False, methods=['get'], url_path='me/teacher')
     def my_teacher_assignments(self, request):
-        """
-        GET /api/v1/operations/assignments/me/teacher/
-        Returns assignments created by the current teacher
-        """
+        """Teacher: list all their assignments with submission stats."""
         try:
             teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
         except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+            return Response({"detail": "Teacher profile not found."}, status=404)
         assignments = Assignment.objects.filter(
-            teacher=teacher,
-            school=request.user.school
+            teacher=teacher, school=request.user.school
         ).select_related('subject', 'section').order_by('-created_at')
-
-        section_id = request.query_params.get('section_id')
-        if section_id:
-            assignments = assignments.filter(section_id=section_id)
-
-        subject_id = request.query_params.get('subject_id')
-        if subject_id:
-            assignments = assignments.filter(subject_id=subject_id)
-
+        if request.query_params.get('section_id'):
+            assignments = assignments.filter(section_id=request.query_params['section_id'])
+        if request.query_params.get('subject_id'):
+            assignments = assignments.filter(subject_id=request.query_params['subject_id'])
         status_filter = request.query_params.get('status')
         now = timezone.now()
         if status_filter == 'upcoming':
             assignments = assignments.filter(due_date__gte=now)
         elif status_filter == 'past':
             assignments = assignments.filter(due_date__lt=now)
-
         data = []
-        for assignment in assignments:
-            submission_count = StudentSubmission.objects.filter(
-                assignment=assignment
-            ).count()
-            
-            graded_count = StudentSubmission.objects.filter(
-                assignment=assignment,
-                grade__isnull=False
-            ).count()
-
+        for a in assignments:
+            total = StudentSubmission.objects.filter(assignment=a).count()
+            graded = StudentSubmission.objects.filter(assignment=a, grade__isnull=False).count()
             data.append({
-                "id": str(assignment.id),
-                "title": assignment.title,
-                "description": assignment.description,
-                "subject": {
-                    "id": str(assignment.subject.id),
-                    "name": assignment.subject.name
-                },
-                "section": {
-                    "id": str(assignment.section.id),
-                    "name": assignment.section.name
-                },
-                "due_date": assignment.due_date,
-                "created_at": assignment.created_at,
-                "submission_count": submission_count,
-                "graded_count": graded_count,
-                "pending_grading": submission_count - graded_count
+                "id": str(a.id), "title": a.title, "description": a.description,
+                "subject": {"id": str(a.subject.id), "name": a.subject.name},
+                "section": {"id": str(a.section.id), "name": a.section.name},
+                "due_date": a.due_date, "created_at": a.created_at,
+                "submission_count": total, "graded_count": graded, "pending_grading": total - graded
             })
+        return Response({"count": len(data), "results": data})
 
-        return Response({
-            "count": len(data),
-            "results": data
-        })
 
-# operations/views.py - StudentSubmissionViewSet (FIXED)
+# ---------------------------------------------------------------------------
+# SUBMISSION  — simplified, mirrors profile picture pattern
+# ---------------------------------------------------------------------------
 
 class StudentSubmissionViewSet(TenantAwareModelViewSet):
     """
-    StudentSubmission ViewSet with proper RBAC:
-    - Students: Can submit assignments and view their own submissions
-    - Parents: Can view their children's submissions via /me/ with student param
-    - Teachers: Can view and grade submissions
-    - Admins: Full access
+    STUDENT
+    -------
+    Step 1: POST /submissions/request-upload/
+            Body: {assignment_id, file_name, content_type}
+            → {upload_url, file_path, expires_in, assignment}
+            (identical shape to profile picture upload URL response)
+
+    Step 2: Frontend PUTs the file directly to upload_url (R2 signed URL).
+
+    Step 3: POST /submissions/confirm/
+            Body: {assignment_id, file_path}
+            → full submission row with embedded view_url
+            (identical to confirming a profile picture)
+
+    GET /submissions/me/
+        → all own submissions, each with embedded view_url
+
+    TEACHER
+    -------
+    GET  /submissions/assignment/{id}/
+         → all submissions for that assignment + view_url per row
+
+    PATCH /submissions/{id}/grade/
+          Body: {grade, remarks}
+          → updated submission row + refreshed view_url
+
+    GET  /submissions/pending/
+         → all ungraded submissions across teacher's assignments
     """
-    queryset = StudentSubmission.objects.select_related('assignment', 'student__user').all()
+
+    queryset = StudentSubmission.objects.select_related(
+        'assignment__subject', 'assignment__section', 'student__user'
+    ).all()
     serializer_class = StudentSubmissionSerializer
 
     def get_permissions(self):
-        if self.action == 'submit':
+        if self.action in ['request_upload', 'confirm', 'my_submissions']:
             return [IsAuthenticated(), IsStudent()]
-        elif self.action in ['initiate_upload', 'complete_upload', 'my_pending_drafts', 'cancel_draft']:
-            return [IsAuthenticated(), IsStudent()]
-        elif self.action in ['my_submissions', 'teacher_pending', 'teacher_assignment_submissions']:
-            return [IsAuthenticated()]
-        elif self.action in ['update', 'partial_update', 'destroy']:
+        if self.action in ['assignment_submissions', 'grade_submission', 'pending_submissions']:
             return [IsAuthenticated(), IsTeacher()]
-        else:
-            return [IsAuthenticated(), IsTeacher()]
+        return [IsAuthenticated(), IsTeacher()]
 
     def get_queryset(self):
         qs = super().get_queryset()
-
-        own_student_id = get_caller_student_id(self.request.user)
-        if own_student_id:
-            return qs.filter(student_id=own_student_id)
-
-        student_id = self.request.query_params.get('student', None)
-        assignment_id = self.request.query_params.get('assignment', None)
-
-        parent_profile = ParentProfile.objects.filter(user=self.request.user).first()
-        if parent_profile:
-            if not student_id:
+        own = get_caller_student_id(self.request.user)
+        if own:
+            return qs.filter(student_id=own)
+        parent = ParentProfile.objects.filter(user=self.request.user).first()
+        if parent:
+            sid = self.request.query_params.get('student')
+            if not sid or not parent_can_access_student(self.request.user, sid):
                 return qs.none()
-            if not parent_can_access_student(self.request.user, student_id):
-                return qs.none()
-
-        if student_id:
-            qs = qs.filter(student_id=student_id)
-        if assignment_id:
-            qs = qs.filter(assignment_id=assignment_id)
-
+            return qs.filter(student_id=sid)
+        # teacher / staff — filter by query params
+        for param, field in [('student', 'student_id'), ('assignment', 'assignment_id')]:
+            v = self.request.query_params.get(param)
+            if v:
+                qs = qs.filter(**{field: v})
         return qs
 
-    @action(detail=False, methods=['post'], url_path='submit')
-    def submit(self, request):
-        own_student_id = get_caller_student_id(request.user)
-        if not own_student_id:
-            raise PermissionDenied("Only students can submit assignments.")
+    # ------------------------------------------------------------------
+    # STEP 1 — student requests a signed upload URL (same as profile pic)
+    # ------------------------------------------------------------------
 
-        assignment_id = request.data.get('assignment')
+    @action(detail=False, methods=['post'], url_path='request-upload')
+    def request_upload(self, request):
+        """
+        POST /api/v1/operations/submissions/request-upload/
+        Body: { "assignment_id": "uuid", "file_name": "essay.pdf", "content_type": "application/pdf" }
+
+        Returns a signed R2 PUT URL. The frontend uploads the file directly
+        to that URL — the Django server never touches the bytes.
+        """
+        try:
+            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
+        except StudentProfile.DoesNotExist:
+            return Response({"detail": "Student profile not found."}, status=404)
+
+        assignment_id = request.data.get('assignment_id')
+        file_name = request.data.get('file_name', '')
+        content_type = request.data.get('content_type', 'application/octet-stream')
+
         if not assignment_id:
-            raise ValidationError({"assignment": "This field is required."})
+            raise ValidationError({"assignment_id": "Required."})
+        if not file_name:
+            raise ValidationError({"file_name": "Required."})
 
-        assignment = Assignment.objects.filter(id=assignment_id, school=request.user.school).first()
-        if not assignment:
-            raise ValidationError({"assignment": "Invalid assignment."})
+        try:
+            assignment = Assignment.objects.get(id=assignment_id, school=request.user.school)
+        except Assignment.DoesNotExist:
+            return Response({"detail": "Assignment not found."}, status=404)
 
-        existing = StudentSubmission.objects.filter(
-            assignment=assignment, student_id=own_student_id
-        ).first()
+        # Build an organised, unique R2 key (same pattern as profile picture)
+        ext = os.path.splitext(file_name)[1] or '.bin'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        file_path = f"submissions/{student.id}/{assignment.id}/{timestamp}_{uuid.uuid4().hex}{ext}"
 
-        file = request.FILES.get('file')
-        if file:
-            file_path = generate_submission_file_path(own_student_id, assignment_id, file.name)
-            from django.core.files.storage import default_storage
-            saved_path = default_storage.save(file_path, file)
+        try:
+            upload_data = r2_storage.generate_upload_url(
+                file_path=file_path,
+                content_type=content_type,
+                expires_in=900  # 15 minutes — same as profile picture
+            )
+        except Exception as e:
+            return Response({"detail": f"Could not generate upload URL: {e}"}, status=502)
+
+        return Response({
+            "upload_url": upload_data['url'],
+            "file_path": file_path,
+            "expires_in": upload_data['expires_in'],
+            "expires_at": upload_data['expires_at'],
+            "assignment": {
+                "id": str(assignment.id),
+                "title": assignment.title,
+                "subject": assignment.subject.name,
+                "section": assignment.section.name,
+                "due_date": assignment.due_date,
+            }
+        }, status=status.HTTP_200_OK)
+
+    # ------------------------------------------------------------------
+    # STEP 3 — student confirms upload, backend creates the submission
+    # ------------------------------------------------------------------
+
+    @action(detail=False, methods=['post'], url_path='confirm')
+    def confirm(self, request):
+        """
+        POST /api/v1/operations/submissions/confirm/
+        Body: { "assignment_id": "uuid", "file_path": "submissions/..." }
+
+        Backend verifies the file exists in R2, then upserts the submission
+        and returns it with an embedded view_url — exactly like confirming
+        a profile picture update.
+        """
+        try:
+            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
+        except StudentProfile.DoesNotExist:
+            return Response({"detail": "Student profile not found."}, status=404)
+
+        assignment_id = request.data.get('assignment_id')
+        file_path = request.data.get('file_path')
+
+        if not assignment_id:
+            raise ValidationError({"assignment_id": "Required."})
+        if not file_path:
+            raise ValidationError({"file_path": "Required."})
+
+        try:
+            assignment = Assignment.objects.get(id=assignment_id, school=request.user.school)
+        except Assignment.DoesNotExist:
+            return Response({"detail": "Assignment not found."}, status=404)
+
+        # Verify the file actually landed in R2
+        if not r2_storage.confirm_upload(file_path):
+            return Response(
+                {"detail": "File not found in storage. Please upload the file first."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Upsert (re-submission replaces the previous file)
+        existing = StudentSubmission.objects.filter(assignment=assignment, student=student).first()
+        if existing:
+            existing.file = file_path
+            existing.status = 'Submitted'
+            existing.save(update_fields=['file', 'status'])
+            submission = existing
         else:
-            saved_path = None
+            submission = StudentSubmission.objects.create(
+                school=request.user.school,
+                assignment=assignment,
+                student=student,
+                file=file_path,
+                status='Submitted',
+            )
 
-        serializer = StudentSubmissionCreateSerializer(
-            instance=existing, data=request.data, partial=bool(existing)
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save(
-            school=request.user.school,
-            student_id=own_student_id,
-            assignment=assignment,
-            file=saved_path,
-            status='Submitted',
-        )
-        return Response(serializer.data, status=status.HTTP_201_CREATED if not existing else status.HTTP_200_OK)
+        view_url = _embed_view_url(file_path)
 
-    def perform_update(self, serializer):
-        user = self.request.user
-        is_teacher_or_staff = user.is_superuser or user.is_staff or TeacherProfile.objects.filter(user=user).exists()
+        return Response({
+            "id": str(submission.id),
+            "assignment_id": str(assignment.id),
+            "assignment_title": assignment.title,
+            "subject": assignment.subject.name,
+            "section": assignment.section.name,
+            "due_date": assignment.due_date,
+            "submitted_at": submission.submitted_at,
+            "file_path": file_path,
+            "view_url": view_url,
+            "view_url_expires_in": "7 days",
+            "status": submission.status,
+            "grade": float(submission.grade) if submission.grade is not None else None,
+        }, status=status.HTTP_201_CREATED if not existing else status.HTTP_200_OK)
 
-        if not is_teacher_or_staff:
-            for field in ('grade', 'status'):
-                serializer.validated_data.pop(field, None)
-
-        super().perform_update(serializer)
-
-    # ============================================
-    # ✅ FIXED: VIEW SUBMISSIONS WITH EMBEDDED VIEW URLS
-    # ============================================
+    # ------------------------------------------------------------------
+    # STUDENT: list own submissions
+    # ------------------------------------------------------------------
 
     @action(detail=False, methods=['get'], url_path='me')
     def my_submissions(self, request):
         """
         GET /api/v1/operations/submissions/me/
-        
-        Returns all submissions with embedded view URLs for the current student
+        Returns the student's submissions with embedded view URLs.
         """
         try:
             student = StudentProfile.objects.get(user=request.user, school=request.user.school)
         except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Student profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"detail": "Student profile not found."}, status=404)
 
-        submissions = StudentSubmission.objects.filter(
-            student=student,
-            school=request.user.school
-        ).select_related('assignment', 'assignment__subject', 'assignment__section')\
-         .order_by('-submitted_at')
+        submissions = list(
+            StudentSubmission.objects.filter(student=student, school=request.user.school)
+            .select_related('assignment__subject', 'assignment__section', 'student__user')
+            .order_by('-submitted_at')
+        )
+        _attach_view_urls(submissions)
+        serializer = SubmissionWithViewUrlSerializer(submissions, many=True)
+        return Response({"count": len(submissions), "results": serializer.data})
 
-        results = []
-        for submission in submissions:
-            # Generate view URL for each submission
-            view_url = None
-            view_expires_at = None
-            
-            # ✅ Fix: Get file path as string
-            file_path = None
-            if submission.file:
-                try:
-                    if hasattr(submission.file, 'name'):
-                        file_path = str(submission.file.name)
-                    elif isinstance(submission.file, str):
-                        file_path = submission.file
-                    else:
-                        file_path = str(submission.file)
-                    
-                    if file_path:
-                        view_data = r2_storage.generate_view_url(
-                            file_path=file_path,
-                            expires_in=604800  # 7 days
-                        )
-                        view_url = view_data['url']
-                        view_expires_at = view_data['expires_at']
-                except Exception as e:
-                    print(f"Error generating view URL: {e}")
-                    # Continue without view URL
+    # ------------------------------------------------------------------
+    # TEACHER: all submissions for one assignment
+    # ------------------------------------------------------------------
 
-            results.append({
-                "id": str(submission.id),
-                "assignment": {
-                    "id": str(submission.assignment.id),
-                    "title": submission.assignment.title,
-                    "subject": submission.assignment.subject.name if submission.assignment.subject else None,
-                    "section": submission.assignment.section.name if submission.assignment.section else None,
-                    "due_date": submission.assignment.due_date
-                },
-                "file_path": file_path,
-                "view_url": view_url,
-                "view_expires_at": view_expires_at,
-                "submitted_at": submission.submitted_at,
-                "grade": float(submission.grade) if submission.grade is not None else None,
-                "status": submission.status
-            })
-
-        return Response({
-            "count": len(results),
-            "results": results
-        })
-
-    # ============================================
-    # NEW: CLEAN UPLOAD FLOW
-    # ============================================
-
-    @action(detail=False, methods=['post'], url_path='initiate-upload')
-    def initiate_upload(self, request):
+    @action(detail=False, methods=['get'], url_path='assignment/(?P<assignment_id>[^/.]+)')
+    def assignment_submissions(self, request, assignment_id):
         """
-        POST /api/v1/operations/submissions/initiate-upload/
-        
-        Step 1: Student initiates upload, gets signed URL and draft ID
+        GET /api/v1/operations/submissions/assignment/{assignment_id}/
+
+        Returns every student's submission for this assignment.
+        Each row includes an embedded view_url so the teacher can open
+        the file directly — no extra API call needed.
         """
         try:
-            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
-        except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Only students can submit assignments."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        assignment_id = request.data.get('assignment_id')
-        file_name = request.data.get('file_name')
-        content_type = request.data.get('content_type', 'application/pdf')
-
-        if not assignment_id or not file_name:
-            return Response(
-                {"detail": "assignment_id and file_name are required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
+        except TeacherProfile.DoesNotExist:
+            return Response({"detail": "Teacher profile not found."}, status=404)
 
         try:
-            assignment = Assignment.objects.get(id=assignment_id, school=request.user.school)
+            assignment = Assignment.objects.get(
+                id=assignment_id, teacher=teacher, school=request.user.school
+            )
         except Assignment.DoesNotExist:
-            return Response(
-                {"detail": "Assignment not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"detail": "Assignment not found or no permission."}, status=403)
 
-        if StudentSubmission.objects.filter(assignment=assignment, student=student).exists():
-            return Response(
-                {"detail": "You have already submitted this assignment."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        file_path = generate_submission_file_path(student.id, assignment.id, file_name)
-
-        upload_data = r2_storage.generate_upload_url(
-            file_path=file_path,
-            content_type=content_type,
-            expires_in=900
+        submissions = list(
+            StudentSubmission.objects.filter(assignment=assignment, school=request.user.school)
+            .select_related('assignment__subject', 'assignment__section', 'student__user')
+            .order_by('-submitted_at')
         )
-
-        pending = PendingSubmission.objects.create(
-            school=request.user.school,
-            student=student,
-            assignment=assignment,
-            file_path=file_path,
-            file_name=file_name,
-            content_type=content_type,
-            expires_at=datetime.now() + timedelta(seconds=900)
-        )
-
+        _attach_view_urls(submissions)
+        serializer = SubmissionWithViewUrlSerializer(submissions, many=True)
+        graded = sum(1 for s in submissions if s.grade is not None)
         return Response({
-            "draft_id": str(pending.id),
-            "upload_url": upload_data['url'],
-            "file_path": file_path,
-            "expires_at": upload_data['expires_at'],
-            "expires_in": upload_data['expires_in'],
             "assignment": {
                 "id": str(assignment.id),
                 "title": assignment.title,
                 "subject": assignment.subject.name,
                 "section": assignment.section.name,
-                "due_date": assignment.due_date
-            }
-        }, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=['post'], url_path='complete-upload')
-    def complete_upload(self, request):
-        """
-        POST /api/v1/operations/submissions/complete-upload/
-        
-        Step 2: Student confirms upload, creates submission entry with embedded view URL
-        """
-        draft_id = request.data.get('draft_id')
-        
-        if not draft_id:
-            return Response(
-                {"detail": "draft_id is required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            pending = PendingSubmission.objects.get(
-                id=draft_id,
-                student__user=request.user,
-                school=request.user.school,
-                is_completed=False
-            )
-        except PendingSubmission.DoesNotExist:
-            return Response(
-                {"detail": "Invalid or expired draft."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        if pending.expires_at < datetime.now():
-            pending.delete()
-            return Response(
-                {"detail": "Upload session has expired. Please start over."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if not r2_storage.confirm_upload(pending.file_path):
-            return Response(
-                {"detail": "File upload could not be verified. Please try again."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        submission = StudentSubmission.objects.create(
-            school=request.user.school,
-            assignment=pending.assignment,
-            student=pending.student,
-            file=pending.file_path,
-            status='Submitted'
-        )
-
-        pending.is_completed = True
-        pending.save(update_fields=['is_completed'])
-
-        view_data = r2_storage.generate_view_url(
-            pending.file_path,
-            expires_in=604800
-        )
-
-        return Response({
-            "submission": {
-                "id": str(submission.id),
-                "assignment": pending.assignment.title,
-                "subject": pending.assignment.subject.name,
-                "section": pending.assignment.section.name,
-                "submitted_at": submission.submitted_at,
-                "file_path": pending.file_path,
-                "file_name": pending.file_name,
-                "view_url": view_data['url'],
-                "view_expires_at": view_data['expires_at'],
-                "view_expires_in": view_data['expires_in'],
-                "status": submission.status
-            }
-        }, status=status.HTTP_201_CREATED)
-
-    @action(detail=False, methods=['get'], url_path='my-pending-drafts')
-    def my_pending_drafts(self, request):
-        """
-        GET /api/v1/operations/submissions/my-pending-drafts/
-        
-        Returns pending drafts for the current student
-        """
-        try:
-            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
-        except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Student profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        pending = PendingSubmission.objects.filter(
-            student=student,
-            school=request.user.school,
-            is_completed=False
-        ).select_related('assignment', 'assignment__subject')
-
-        results = []
-        for p in pending:
-            is_expired = p.expires_at < datetime.now()
-            results.append({
-                "draft_id": str(p.id),
-                "assignment": {
-                    "id": str(p.assignment.id),
-                    "title": p.assignment.title,
-                    "subject": p.assignment.subject.name
-                },
-                "file_name": p.file_name,
-                "file_path": p.file_path,
-                "created_at": p.created_at,
-                "expires_at": p.expires_at,
-                "is_expired": is_expired
-            })
-
-        return Response({
-            "count": len(results),
-            "results": results
-        })
-
-    @action(detail=False, methods=['delete'], url_path='cancel-draft')
-    def cancel_draft(self, request):
-        """
-        DELETE /api/v1/operations/submissions/cancel-draft/
-        
-        Cancels a pending draft
-        """
-        draft_id = request.data.get('draft_id')
-        
-        if not draft_id:
-            return Response(
-                {"detail": "draft_id is required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            pending = PendingSubmission.objects.get(
-                id=draft_id,
-                student__user=request.user,
-                school=request.user.school,
-                is_completed=False
-            )
-            pending.delete()
-            return Response(
-                {"detail": "Draft cancelled successfully."},
-                status=status.HTTP_200_OK
-            )
-        except PendingSubmission.DoesNotExist:
-            return Response(
-                {"detail": "Draft not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-    # ============================================
-    # TEACHER VIEWS WITH EMBEDDED VIEW URLS
-    # ============================================
-
-    @action(detail=False, methods=['get'], url_path='teacher/pending')
-    def teacher_pending(self, request):
-        """
-        GET /api/v1/operations/submissions/teacher/pending/
-        
-        Teacher views all pending submissions across all their assignments
-        with embedded view URLs
-        """
-        try:
-            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
-        except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        assignments = Assignment.objects.filter(
-            teacher=teacher,
-            school=request.user.school
-        )
-
-        pending_submissions = StudentSubmission.objects.filter(
-            school=request.user.school,
-            assignment__in=assignments,
-            grade__isnull=True,
-            status='Submitted'
-        ).select_related('assignment', 'student__user', 'assignment__subject', 'assignment__section')\
-         .order_by('-submitted_at')
-
-        results = []
-        for submission in pending_submissions:
-            view_url = None
-            view_expires_at = None
-            if submission.file:
-                try:
-                    view_data = r2_storage.generate_view_url(
-                        submission.file,
-                        expires_in=604800
-                    )
-                    view_url = view_data['url']
-                    view_expires_at = view_data['expires_at']
-                except Exception:
-                    pass
-
-            results.append({
-                "submission_id": str(submission.id),
-                "student": {
-                    "id": str(submission.student.id),
-                    "name": f"{submission.student.user.first_name} {submission.student.user.last_name}",
-                    "enrollment_number": submission.student.enrollment_number
-                },
-                "assignment": {
-                    "id": str(submission.assignment.id),
-                    "title": submission.assignment.title,
-                    "subject": submission.assignment.subject.name,
-                    "section": submission.assignment.section.name,
-                    "due_date": submission.assignment.due_date
-                },
-                "file_path": submission.file,
-                "view_url": view_url,
-                "view_expires_at": view_expires_at,
-                "submitted_at": submission.submitted_at
-            })
-
-        return Response({
-            "count": len(results),
-            "results": results
-        })
-
-    @action(detail=False, methods=['get'], url_path='teacher/assignment/(?P<assignment_id>[^/.]+)')
-    def teacher_assignment_submissions(self, request, assignment_id):
-        """
-        GET /api/v1/operations/submissions/teacher/assignment/{assignment_id}/
-        
-        Teacher views all submissions for an assignment with embedded view URLs
-        """
-        try:
-            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
-        except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        assignment = Assignment.objects.filter(
-            id=assignment_id,
-            teacher=teacher,
-            school=request.user.school
-        ).first()
-
-        if not assignment:
-            return Response(
-                {"detail": "Assignment not found or you don't have permission."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        submissions = StudentSubmission.objects.filter(
-            assignment=assignment,
-            school=request.user.school
-        ).select_related('student__user').order_by('-submitted_at')
-
-        results = []
-        for submission in submissions:
-            view_url = None
-            view_expires_at = None
-            if submission.file:
-                try:
-                    view_data = r2_storage.generate_view_url(
-                        submission.file,
-                        expires_in=604800
-                    )
-                    view_url = view_data['url']
-                    view_expires_at = view_data['expires_at']
-                except Exception:
-                    pass
-
-            results.append({
-                "submission_id": str(submission.id),
-                "student": {
-                    "id": str(submission.student.id),
-                    "name": f"{submission.student.user.first_name} {submission.student.user.last_name}",
-                    "enrollment_number": submission.student.enrollment_number,
-                    "email": submission.student.user.email
-                },
-                "file_path": submission.file,
-                "view_url": view_url,
-                "view_expires_at": view_expires_at,
-                "submitted_at": submission.submitted_at,
-                "grade": float(submission.grade) if submission.grade is not None else None,
-                "status": submission.status
-            })
-
-        return Response({
-            "assignment": {
-                "id": str(assignment.id),
-                "title": assignment.title,
-                "description": assignment.description,
-                "subject": assignment.subject.name,
-                "section": assignment.section.name,
-                "due_date": assignment.due_date
+                "due_date": assignment.due_date,
             },
             "summary": {
-                "total_submissions": len(results),
-                "graded": len([s for s in results if s['grade'] is not None]),
-                "pending": len([s for s in results if s['grade'] is None])
+                "total_submissions": len(submissions),
+                "graded": graded,
+                "pending": len(submissions) - graded,
             },
-            "submissions": results
+            "submissions": serializer.data,
         })
 
-    # ============================================
-    # LEGACY METHODS - KEPT FOR BACKWARDS COMPATIBILITY
-    # ============================================
+    # ------------------------------------------------------------------
+    # TEACHER: grade a submission
+    # ------------------------------------------------------------------
 
-    @action(detail=False, methods=['post'], url_path='submit-with-file')
-    def submit_with_file(self, request):
-        """DEPRECATED: Use /initiate-upload/ instead."""
-        return self.initiate_upload(request)
+    @action(detail=True, methods=['patch'], url_path='grade')
+    def grade_submission(self, request, pk=None):
+        """
+        PATCH /api/v1/operations/submissions/{id}/grade/
+        Body: { "grade": 87.5, "remarks": "Good work" }
 
-    @action(detail=False, methods=['post'], url_path='confirm-submission-file')
-    def confirm_submission_file(self, request):
-        """DEPRECATED: Use /complete-upload/ instead."""
-        return self.complete_upload(request)
+        Only the teacher who owns the assignment can grade it.
+        Returns the updated submission row with a fresh view_url.
+        """
+        try:
+            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
+        except TeacherProfile.DoesNotExist:
+            return Response({"detail": "Teacher profile not found."}, status=404)
 
-    @action(detail=False, methods=['get'], url_path='me/pending')
-    def me_pending_submissions(self, request):
-        """DEPRECATED: Use /my-pending-drafts/ instead."""
-        return self.my_pending_drafts(request)
+        try:
+            submission = StudentSubmission.objects.select_related(
+                'assignment__subject', 'assignment__section', 'student__user'
+            ).get(id=pk, school=request.user.school)
+        except StudentSubmission.DoesNotExist:
+            return Response({"detail": "Submission not found."}, status=404)
 
-    @action(detail=False, methods=['get'], url_path='me/assignment/(?P<assignment_id>[^/.]+)')
-    def my_assignment_submissions(self, request, assignment_id):
-        """DEPRECATED: Use /teacher/assignment/{assignment_id}/ instead."""
-        return self.teacher_assignment_submissions(request, assignment_id)
+        if submission.assignment.teacher_id != teacher.id:
+            return Response(
+                {"detail": "You can only grade submissions for your own assignments."},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
-    @action(detail=False, methods=['get'], url_path='me/pending_old')
-    def old_pending_submissions(self, request):
-        """DEPRECATED: Use /teacher/pending/ instead."""
-        return self.teacher_pending(request)
-    """
-    StudentSubmission ViewSet with proper RBAC:
-    - Students: Can submit assignments and view their own submissions
-    - Parents: Can view their children's submissions via /me/ with student param
-    - Teachers: Can view and grade submissions
-    - Admins: Full access
-    """
-    queryset = StudentSubmission.objects.select_related('assignment', 'student__user').all()
-    serializer_class = StudentSubmissionSerializer
+        grade = request.data.get('grade')
+        remarks = request.data.get('remarks', '')
 
-    def get_permissions(self):
-        if self.action == 'submit':
-            return [IsAuthenticated(), IsStudent()]
-        elif self.action in ['initiate_upload', 'complete_upload', 'my_pending_drafts', 'cancel_draft']:
-            return [IsAuthenticated(), IsStudent()]
-        elif self.action in ['my_submissions', 'teacher_pending', 'teacher_assignment_submissions']:
-            return [IsAuthenticated()]
-        elif self.action in ['update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsTeacher()]
-        else:
-            return [IsAuthenticated(), IsTeacher()]
+        if grade is None:
+            raise ValidationError({"grade": "Required."})
+        try:
+            grade = float(grade)
+        except (TypeError, ValueError):
+            raise ValidationError({"grade": "Must be a number."})
+        if grade < 0:
+            raise ValidationError({"grade": "Cannot be negative."})
 
-    def get_queryset(self):
-        qs = super().get_queryset()
+        submission.grade = grade
+        submission.status = 'Graded'
+        submission.save(update_fields=['grade', 'status'])
 
-        own_student_id = get_caller_student_id(self.request.user)
-        if own_student_id:
-            return qs.filter(student_id=own_student_id)
+        view_url = _embed_view_url(submission.file)
 
-        student_id = self.request.query_params.get('student', None)
-        assignment_id = self.request.query_params.get('assignment', None)
+        return Response({
+            "id": str(submission.id),
+            "student": {
+                "id": str(submission.student.id),
+                "name": f"{submission.student.user.first_name} {submission.student.user.last_name}",
+                "enrollment_number": submission.student.enrollment_number,
+            },
+            "assignment": {
+                "id": str(submission.assignment.id),
+                "title": submission.assignment.title,
+                "subject": submission.assignment.subject.name,
+                "section": submission.assignment.section.name,
+            },
+            "file_path": _file_path_str(submission.file),
+            "view_url": view_url,
+            "view_url_expires_in": "7 days",
+            "submitted_at": submission.submitted_at,
+            "grade": float(submission.grade),
+            "status": submission.status,
+            "remarks": remarks,
+        })
 
-        parent_profile = ParentProfile.objects.filter(user=self.request.user).first()
-        if parent_profile:
-            if not student_id:
-                return qs.none()
-            if not parent_can_access_student(self.request.user, student_id):
-                return qs.none()
+    # ------------------------------------------------------------------
+    # TEACHER: all pending (ungraded) submissions
+    # ------------------------------------------------------------------
 
-        if student_id:
-            qs = qs.filter(student_id=student_id)
-        if assignment_id:
-            qs = qs.filter(assignment_id=assignment_id)
+    @action(detail=False, methods=['get'], url_path='pending')
+    def pending_submissions(self, request):
+        """
+        GET /api/v1/operations/submissions/pending/
+        All ungraded submitted work across all the teacher's assignments.
+        Optional ?assignment_id= to narrow down.
+        """
+        try:
+            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
+        except TeacherProfile.DoesNotExist:
+            return Response({"detail": "Teacher profile not found."}, status=404)
 
-        return qs
-
-    @action(detail=False, methods=['post'], url_path='submit')
-    def submit(self, request):
-        own_student_id = get_caller_student_id(request.user)
-        if not own_student_id:
-            raise PermissionDenied("Only students can submit assignments.")
-
-        assignment_id = request.data.get('assignment')
-        if not assignment_id:
-            raise ValidationError({"assignment": "This field is required."})
-
-        assignment = Assignment.objects.filter(id=assignment_id, school=request.user.school).first()
-        if not assignment:
-            raise ValidationError({"assignment": "Invalid assignment."})
-
-        existing = StudentSubmission.objects.filter(
-            assignment=assignment, student_id=own_student_id
-        ).first()
-
-        # ✅ FIX: Generate organized file path BEFORE saving
-        file = request.FILES.get('file')
-        if file:
-            # Generate organized path using the helper
-            file_path = generate_submission_file_path(own_student_id, assignment_id, file.name)
-            # Store the path in the file field
-            # The file will be saved to Django's storage with this path
-            # We need to override the default upload behavior
-            from django.core.files.storage import default_storage
-            saved_path = default_storage.save(file_path, file)
-        else:
-            saved_path = None
-
-        serializer = StudentSubmissionCreateSerializer(
-            instance=existing, data=request.data, partial=bool(existing)
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save(
+        teacher_assignments = Assignment.objects.filter(teacher=teacher, school=request.user.school)
+        pending = StudentSubmission.objects.filter(
             school=request.user.school,
-            student_id=own_student_id,
-            assignment=assignment,
-            file=saved_path,  # Use the organized path
+            assignment__in=teacher_assignments,
+            grade__isnull=True,
             status='Submitted',
-        )
-        return Response(serializer.data, status=status.HTTP_201_CREATED if not existing else status.HTTP_200_OK)
+        ).select_related('assignment__subject', 'assignment__section', 'student__user').order_by('-submitted_at')
 
-    def perform_update(self, serializer):
-        user = self.request.user
-        is_teacher_or_staff = user.is_superuser or user.is_staff or TeacherProfile.objects.filter(user=user).exists()
+        if request.query_params.get('assignment_id'):
+            pending = pending.filter(assignment_id=request.query_params['assignment_id'])
 
-        if not is_teacher_or_staff:
-            for field in ('grade', 'status'):
-                serializer.validated_data.pop(field, None)
-
-        super().perform_update(serializer)
-
-    # ============================================
-    # NEW: CLEAN UPLOAD FLOW
-    # ============================================
-
-    @action(detail=False, methods=['post'], url_path='initiate-upload')
-    def initiate_upload(self, request):
-        """
-        POST /api/v1/operations/submissions/initiate-upload/
-        
-        Step 1: Student initiates upload, gets signed URL and draft ID
-        
-        Request:
-        {
-            "assignment_id": "uuid",
-            "file_name": "syllabus.pdf",
-            "content_type": "application/pdf"
-        }
-        
-        Response:
-        {
-            "draft_id": "uuid",
-            "upload_url": "https://r2.signed.url",
-            "file_path": "submissions/{student_id}/{assignment_id}/{uuid}.pdf",
-            "expires_at": "2026-06-22T10:00:00Z",
-            "expires_in": 900,
-            "assignment": {
-                "id": "uuid",
-                "title": "Science Project",
-                "subject": "Biology"
-            }
-        }
-        """
-        # Check if user is a student
-        try:
-            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
-        except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Only students can submit assignments."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        assignment_id = request.data.get('assignment_id')
-        file_name = request.data.get('file_name')
-        content_type = request.data.get('content_type', 'application/pdf')
-
-        if not assignment_id or not file_name:
-            return Response(
-                {"detail": "assignment_id and file_name are required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            assignment = Assignment.objects.get(id=assignment_id, school=request.user.school)
-        except Assignment.DoesNotExist:
-            return Response(
-                {"detail": "Assignment not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        # Check if already submitted
-        if StudentSubmission.objects.filter(
-            assignment=assignment,
-            student=student
-        ).exists():
-            return Response(
-                {"detail": "You have already submitted this assignment."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Generate organized file path
-        file_path = generate_submission_file_path(student.id, assignment.id, file_name)
-
-        # Generate signed upload URL
-        upload_data = r2_storage.generate_upload_url(
-            file_path=file_path,
-            content_type=content_type,
-            expires_in=900  # 15 minutes
-        )
-
-        # Create pending submission record
-        pending = PendingSubmission.objects.create(
-            school=request.user.school,
-            student=student,
-            assignment=assignment,
-            file_path=file_path,
-            file_name=file_name,
-            content_type=content_type,
-            expires_at=datetime.now() + timedelta(seconds=900)
-        )
-
-        return Response({
-            "draft_id": str(pending.id),
-            "upload_url": upload_data['url'],
-            "file_path": file_path,
-            "expires_at": upload_data['expires_at'],
-            "expires_in": upload_data['expires_in'],
-            "assignment": {
-                "id": str(assignment.id),
-                "title": assignment.title,
-                "subject": assignment.subject.name,
-                "section": assignment.section.name,
-                "due_date": assignment.due_date
-            }
-        }, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=['post'], url_path='complete-upload')
-    def complete_upload(self, request):
-        """
-        POST /api/v1/operations/submissions/complete-upload/
-        
-        Step 2: Student confirms upload, creates submission entry with embedded view URL
-        
-        Request:
-        {
-            "draft_id": "uuid"
-        }
-        
-        Response:
-        {
-            "submission": {
-                "id": "uuid",
-                "assignment": "Science Project",
-                "subject": "Biology",
-                "section": "Daisy",
-                "submitted_at": "2026-06-22T09:00:00Z",
-                "file_path": "submissions/...",
-                "file_name": "syllabus.pdf",
-                "view_url": "https://r2.signed.view.url",
-                "view_expires_at": "2026-06-29T09:00:00Z",
-                "view_expires_in": 604800,
-                "status": "Submitted"
-            }
-        }
-        """
-        draft_id = request.data.get('draft_id')
-        
-        if not draft_id:
-            return Response(
-                {"detail": "draft_id is required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            pending = PendingSubmission.objects.get(
-                id=draft_id,
-                student__user=request.user,
-                school=request.user.school,
-                is_completed=False
-            )
-        except PendingSubmission.DoesNotExist:
-            return Response(
-                {"detail": "Invalid or expired draft."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        # Check if draft has expired
-        if pending.expires_at < datetime.now():
-            pending.delete()
-            return Response(
-                {"detail": "Upload session has expired. Please start over."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Verify file was uploaded to R2
-        if not r2_storage.confirm_upload(pending.file_path):
-            return Response(
-                {"detail": "File upload could not be verified. Please try again."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Create the submission
-        submission = StudentSubmission.objects.create(
-            school=request.user.school,
-            assignment=pending.assignment,
-            student=pending.student,
-            file=pending.file_path,  # Store the organized path
-            status='Submitted'
-        )
-
-        # Mark pending as completed
-        pending.is_completed = True
-        pending.save(update_fields=['is_completed'])
-
-        # Generate view URL (valid for 7 days)
-        view_data = r2_storage.generate_view_url(
-            pending.file_path,
-            expires_in=604800  # 7 days
-        )
-
-        return Response({
-            "submission": {
-                "id": str(submission.id),
-                "assignment": pending.assignment.title,
-                "subject": pending.assignment.subject.name,
-                "section": pending.assignment.section.name,
-                "submitted_at": submission.submitted_at,
-                "file_path": pending.file_path,
-                "file_name": pending.file_name,
-                "view_url": view_data['url'],
-                "view_expires_at": view_data['expires_at'],
-                "view_expires_in": view_data['expires_in'],
-                "status": submission.status
-            }
-        }, status=status.HTTP_201_CREATED)
-
-    @action(detail=False, methods=['get'], url_path='my-pending-drafts')
-    def my_pending_drafts(self, request):
-        """
-        GET /api/v1/operations/submissions/my-pending-drafts/
-        
-        Returns pending drafts for the current student
-        """
-        try:
-            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
-        except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Student profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        pending = PendingSubmission.objects.filter(
-            student=student,
-            school=request.user.school,
-            is_completed=False
-        ).select_related('assignment', 'assignment__subject')
-
-        results = []
-        for p in pending:
-            is_expired = p.expires_at < datetime.now()
-            results.append({
-                "draft_id": str(p.id),
-                "assignment": {
-                    "id": str(p.assignment.id),
-                    "title": p.assignment.title,
-                    "subject": p.assignment.subject.name
-                },
-                "file_name": p.file_name,
-                "file_path": p.file_path,
-                "created_at": p.created_at,
-                "expires_at": p.expires_at,
-                "is_expired": is_expired
-            })
-
-        return Response({
-            "count": len(results),
-            "results": results
-        })
-
-    @action(detail=False, methods=['delete'], url_path='cancel-draft')
-    def cancel_draft(self, request):
-        """
-        DELETE /api/v1/operations/submissions/cancel-draft/
-        
-        Cancels a pending draft
-        Request:
-        {
-            "draft_id": "uuid"
-        }
-        """
-        draft_id = request.data.get('draft_id')
-        
-        if not draft_id:
-            return Response(
-                {"detail": "draft_id is required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            pending = PendingSubmission.objects.get(
-                id=draft_id,
-                student__user=request.user,
-                school=request.user.school,
-                is_completed=False
-            )
-            pending.delete()
-            return Response(
-                {"detail": "Draft cancelled successfully."},
-                status=status.HTTP_200_OK
-            )
-        except PendingSubmission.DoesNotExist:
-            return Response(
-                {"detail": "Draft not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-    # ============================================
-    # VIEW SUBMISSIONS WITH EMBEDDED VIEW URLS
-    # ============================================
-
-    @action(detail=False, methods=['get'], url_path='me')
-    def my_submissions(self, request):
-        """
-        GET /api/v1/operations/submissions/me/
-        
-        Returns all submissions with embedded view URLs for the current student
-        """
-        try:
-            student = StudentProfile.objects.get(user=request.user, school=request.user.school)
-        except StudentProfile.DoesNotExist:
-            return Response(
-                {"detail": "Student profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        submissions = StudentSubmission.objects.filter(
-            student=student,
-            school=request.user.school
-        ).select_related('assignment', 'assignment__subject', 'assignment__section')\
-         .order_by('-submitted_at')
-
-        results = []
-        for submission in submissions:
-            # Generate view URL for each submission
-            view_url = None
-            view_expires_at = None
-            if submission.file:
-                try:
-                    view_data = r2_storage.generate_view_url(
-                        submission.file,
-                        expires_in=604800  # 7 days
-                    )
-                    view_url = view_data['url']
-                    view_expires_at = view_data['expires_at']
-                except Exception:
-                    pass
-
-            results.append({
-                "id": str(submission.id),
-                "assignment": {
-                    "id": str(submission.assignment.id),
-                    "title": submission.assignment.title,
-                    "subject": submission.assignment.subject.name,
-                    "section": submission.assignment.section.name,
-                    "due_date": submission.assignment.due_date
-                },
-                "file_path": submission.file,
-                "view_url": view_url,
-                "view_expires_at": view_expires_at,
-                "submitted_at": submission.submitted_at,
-                "grade": float(submission.grade) if submission.grade is not None else None,
-                "status": submission.status
-            })
-
-        return Response({
-            "count": len(results),
-            "results": results
-        })
-
-    # ============================================
-    # TEACHER VIEWS WITH EMBEDDED VIEW URLS
-    # ============================================
-
-    @action(detail=False, methods=['get'], url_path='teacher/pending')
-    def teacher_pending(self, request):
-        """
-        GET /api/v1/operations/submissions/teacher/pending/
-        
-        Teacher views all pending submissions across all their assignments
-        with embedded view URLs
-        """
-        try:
-            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
-        except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        assignments = Assignment.objects.filter(
-            teacher=teacher,
-            school=request.user.school
-        )
-
-        pending_submissions = StudentSubmission.objects.filter(
-            school=request.user.school,
-            assignment__in=assignments,
-            grade__isnull=True,
-            status='Submitted'
-        ).select_related('assignment', 'student__user', 'assignment__subject', 'assignment__section')\
-         .order_by('-submitted_at')
-
-        results = []
-        for submission in pending_submissions:
-            # Generate view URL for each submission
-            view_url = None
-            view_expires_at = None
-            if submission.file:
-                try:
-                    view_data = r2_storage.generate_view_url(
-                        submission.file,
-                        expires_in=604800  # 7 days
-                    )
-                    view_url = view_data['url']
-                    view_expires_at = view_data['expires_at']
-                except Exception:
-                    pass
-
-            results.append({
-                "submission_id": str(submission.id),
-                "student": {
-                    "id": str(submission.student.id),
-                    "name": f"{submission.student.user.first_name} {submission.student.user.last_name}",
-                    "enrollment_number": submission.student.enrollment_number
-                },
-                "assignment": {
-                    "id": str(submission.assignment.id),
-                    "title": submission.assignment.title,
-                    "subject": submission.assignment.subject.name,
-                    "section": submission.assignment.section.name,
-                    "due_date": submission.assignment.due_date
-                },
-                "file_path": submission.file,
-                "view_url": view_url,
-                "view_expires_at": view_expires_at,
-                "submitted_at": submission.submitted_at
-            })
-
-        return Response({
-            "count": len(results),
-            "results": results
-        })
-
-    @action(detail=False, methods=['get'], url_path='teacher/assignment/(?P<assignment_id>[^/.]+)')
-    def teacher_assignment_submissions(self, request, assignment_id):
-        """
-        GET /api/v1/operations/submissions/teacher/assignment/{assignment_id}/
-        
-        Teacher views all submissions for an assignment with embedded view URLs
-        """
-        try:
-            teacher = TeacherProfile.objects.get(user=request.user, school=request.user.school)
-        except TeacherProfile.DoesNotExist:
-            return Response(
-                {"detail": "Teacher profile not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        # Verify teacher owns this assignment
-        assignment = Assignment.objects.filter(
-            id=assignment_id,
-            teacher=teacher,
-            school=request.user.school
-        ).first()
-
-        if not assignment:
-            return Response(
-                {"detail": "Assignment not found or you don't have permission."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        submissions = StudentSubmission.objects.filter(
-            assignment=assignment,
-            school=request.user.school
-        ).select_related('student__user').order_by('-submitted_at')
-
-        results = []
-        for submission in submissions:
-            # Generate view URL for each submission
-            view_url = None
-            view_expires_at = None
-            if submission.file:
-                try:
-                    view_data = r2_storage.generate_view_url(
-                        submission.file,
-                        expires_in=604800  # 7 days
-                    )
-                    view_url = view_data['url']
-                    view_expires_at = view_data['expires_at']
-                except Exception:
-                    pass
-
-            results.append({
-                "submission_id": str(submission.id),
-                "student": {
-                    "id": str(submission.student.id),
-                    "name": f"{submission.student.user.first_name} {submission.student.user.last_name}",
-                    "enrollment_number": submission.student.enrollment_number,
-                    "email": submission.student.user.email
-                },
-                "file_path": submission.file,
-                "view_url": view_url,
-                "view_expires_at": view_expires_at,
-                "submitted_at": submission.submitted_at,
-                "grade": float(submission.grade) if submission.grade is not None else None,
-                "status": submission.status
-            })
-
-        return Response({
-            "assignment": {
-                "id": str(assignment.id),
-                "title": assignment.title,
-                "description": assignment.description,
-                "subject": assignment.subject.name,
-                "section": assignment.section.name,
-                "due_date": assignment.due_date
-            },
-            "summary": {
-                "total_submissions": len(results),
-                "graded": len([s for s in results if s['grade'] is not None]),
-                "pending": len([s for s in results if s['grade'] is None])
-            },
-            "submissions": results
-        })
-
-    # ============================================
-    # LEGACY METHODS - KEPT FOR BACKWARDS COMPATIBILITY
-    # ============================================
-
-    @action(detail=False, methods=['post'], url_path='submit-with-file')
-    def submit_with_file(self, request):
-        """
-        DEPRECATED: Use /initiate-upload/ instead.
-        This is kept for backward compatibility.
-        """
-        return self.initiate_upload(request)
-
-    @action(detail=False, methods=['post'], url_path='confirm-submission-file')
-    def confirm_submission_file(self, request):
-        """
-        DEPRECATED: Use /complete-upload/ instead.
-        This is kept for backward compatibility.
-        """
-        return self.complete_upload(request)
-
-    @action(detail=False, methods=['get'], url_path='me/pending')
-    def me_pending_submissions(self, request):
-        """
-        DEPRECATED: Use /my-pending-drafts/ instead.
-        This is kept for backward compatibility.
-        """
-        return self.my_pending_drafts(request)
-
-    @action(detail=False, methods=['get'], url_path='me/assignment/(?P<assignment_id>[^/.]+)')
-    def my_assignment_submissions(self, request, assignment_id):
-        """
-        DEPRECATED: Use /teacher/assignment/{assignment_id}/ instead.
-        This is kept for backward compatibility.
-        """
-        return self.teacher_assignment_submissions(request, assignment_id)
-
-    @action(detail=False, methods=['get'], url_path='me/pending_old')
-    def old_pending_submissions(self, request):
-        """
-        DEPRECATED: Use /teacher/pending/ instead.
-        This is kept for backward compatibility.
-        """
-        return self.teacher_pending(request)
+        pending = list(pending)
+        _attach_view_urls(pending)
+        serializer = SubmissionWithViewUrlSerializer(pending, many=True)
+        return Response({"count": len(pending), "results": serializer.data})
