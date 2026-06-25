@@ -57,7 +57,7 @@ services:
                 core.wsgi:application
       "
     ports:
-      - "8000:8000"
+      - "8082:8000"
     volumes:
       - ./staticfiles:/app/staticfiles
       - ./media:/app/media
