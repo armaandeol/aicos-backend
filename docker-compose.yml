@@ -9,9 +9,10 @@ services:
       # Django Settings
       - DJANGO_SECRET_KEY=iz!@@e=byp!e@tbcva_c)9jhnn$+t*&mg0qat#rci%(9@4qaki
       - DEBUG=True
-      - ALLOWED_HOSTS=localhost,127.0.0.1,147.93.108.82,187.127.139.208,api.aicos.gridsphere.in,attendance.gridsphere.in
-      - CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000,https://api.aicos.gridsphere.in
-      - DJANGO_SETTINGS_MODULE=core.settings.prod
+      - ALLOWED_HOSTS=localhost,127.0.0.1,147.93.108.82,187.127.139.208,api.aicos.gridsphere.in,aicos.gridsphere.in,attendance.gridsphere.in
+      - CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000,https://api.aicos.gridsphere.in,https://aicos.gridsphere.in
+      - DJANGO_SETTINGS_MODULE=core.settings.prod  # ← ADDED
+      - CSRF_TRUSTED_ORIGINS=https://aicos.gridsphere.in,https://api.aicos.gridsphere.in
       
       # Database
       - DATABASE_URL=postgresql://neondb_owner:npg_V2Bnuz5xFpYe@ep-nameless-bird-a1pl9bnj-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
